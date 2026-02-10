@@ -1,0 +1,140 @@
+\documentclass[aps,prd,reprint,superscriptaddress,nofootinbib,floatfix]{revtex4-2}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{lineno}
+
+\begin{document}
+\title{Decision-Grade Calibration of Negative-Slope Discriminability in a Dark-Siren-Motivated Growth-Mapping Pipeline}
+
+\author{Aiden B. Smith}
+\affiliation{Independent Researcher}
+
+\begin{abstract}
+This Letter reports a decision-grade calibration test of whether a dark-siren-motivated growth-mapping pipeline can distinguish relative versus absolute coupling constructions in synthetic truth-labeled injections. A fixed threshold ($\tau=0.0646$) from prior calibration is held fixed and evaluated on a large power-map suite with 192 tasks (4 truth points, 48 holdouts each, 256 replicates per holdout). For the baseline decision run, the mean true-positive rate across relative-truth points is 0.4043, the mean false-positive rate on the absolute-truth point is 0.2983, and the separation is $\Delta_{\rm sep}=0.1059$. Three additional full-core replicate seeds yield $\Delta_{\rm sep}=\{0.1000,0.1067,0.1089\}$, giving a four-run mean 0.1054 with run-to-run standard deviation 0.0038. These results show stable, nonzero out-of-sample discriminability under fixed scoring and threshold rules, but only at moderate strength. The test therefore supports a calibrated and reproducible directional signal within this model family, while remaining insufficient for model-independent physical confirmation on its own.
+\end{abstract}
+
+\maketitle
+\linenumbers
+\modulolinenumbers[5]
+
+\section{Test definition}
+For each replicate, let
+\begin{equation}
+\Delta s \equiv s_{\rm rel} - s_{\rm abs},
+\end{equation}
+where $s_{\rm rel}$ and $s_{\rm abs}$ are paired scores under relative and absolute growth mappings. A replicate is classified as ``relative'' if $\Delta s \ge \tau$ and ``absolute'' otherwise, using fixed threshold
+\begin{equation}
+\tau = 0.06459924567842923.
+\end{equation}
+
+\section{Decision-grade run}
+The decision configuration used:
+\begin{itemize}
+\item truth grid: relative $\nu=\{0.2,0.5,0.8\}$ and absolute $\nu=0.0$;
+\item holdouts per truth point: 48;
+\item replicates per holdout: 256;
+\item workers: 256 CPU processes;
+\item run output: \texttt{outputs/growth\_mapping\_power\_map\_decision\_20260210\_044918UTC/}.
+\end{itemize}
+
+Point-level rates from the baseline decision run:
+\begin{align}
+\mathrm{TPR}_{\nu=0.2} &= 0.3432,\\
+\mathrm{TPR}_{\nu=0.5} &= 0.3805,\\
+\mathrm{TPR}_{\nu=0.8} &= 0.4892,\\
+\mathrm{FPR}_{\nu=0.0} &= 0.2983.
+\end{align}
+Global means are
+\begin{align}
+\langle \mathrm{TPR}_{\rm rel} \rangle &= 0.4043,\\
+\langle \mathrm{FPR}_{\rm abs} \rangle &= 0.2983,\\
+\Delta_{\rm sep} &= 0.1059.
+\end{align}
+
+\begin{center}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l l r}
+\hline
+Metric & Visual scale (0 to 0.60) & Value \\
+\hline
+TPR ($\nu=0.2$) & \rule{4.58cm}{1.8ex} & 0.3432 \\
+TPR ($\nu=0.5$) & \rule{5.07cm}{1.8ex} & 0.3805 \\
+TPR ($\nu=0.8$) & \rule{6.52cm}{1.8ex} & 0.4892 \\
+FPR ($\nu=0.0$) & \rule{3.98cm}{1.8ex} & 0.2983 \\
+\hline
+\end{tabular}
+\par\smallskip
+{\small \textbf{Figure 1.} Point-level classification rates from the baseline decision-grade run, showing monotonic increase in TPR across relative-truth points and lower absolute-truth FPR.}
+\end{center}
+
+\section{Replicate stability}
+Three additional full-core seeds were run sequentially with all settings fixed:
+\begin{itemize}
+\item \texttt{outputs/growth\_mapping\_power\_map\_decision\_replicates\_seq\_20260210\_045915UTC/seed\_20260212/}
+\item \texttt{outputs/growth\_mapping\_power\_map\_decision\_replicates\_seq\_20260210\_045915UTC/seed\_20260213/}
+\item \texttt{outputs/growth\_mapping\_power\_map\_decision\_replicates\_seq\_20260210\_045915UTC/seed\_20260214/}
+\end{itemize}
+The separation values were
+\begin{equation}
+\Delta_{\rm sep}=\{0.1000,\ 0.1067,\ 0.1089\},
+\end{equation}
+and across all four decision-grade runs (baseline + 3 replicates),
+\begin{equation}
+\langle \Delta_{\rm sep} \rangle = 0.1054,\qquad \sigma_{\rm run}=0.0038.
+\end{equation}
+
+\begin{center}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l l r}
+\hline
+Run & Visual scale (0 to 0.12) & $\Delta_{\rm sep}$ \\
+\hline
+Baseline & \rule{7.06cm}{1.8ex} & 0.1059 \\
+Rep-1 & \rule{6.67cm}{1.8ex} & 0.1000 \\
+Rep-2 & \rule{7.11cm}{1.8ex} & 0.1067 \\
+Rep-3 & \rule{7.26cm}{1.8ex} & 0.1089 \\
+\hline
+Mean & \rule{7.03cm}{1.8ex} & 0.1054 \\
+\hline
+\end{tabular}
+\par\smallskip
+{\small \textbf{Figure 2.} Run-to-run stability of separation across baseline plus three replicate seeds. The spread is small relative to the mean positive separation.}
+\end{center}
+
+\section{Interpretation}
+This test establishes that the calibrated classifier produces a stable positive separation under independent seeds and fixed rules. The effect is reproducible but moderate, so this result is best interpreted as calibration-grade evidence of nonzero discriminability in the tested model family, not as a standalone physical proof.
+
+\section*{Data and software availability}
+Software archive for this pipeline: \href{https://doi.org/10.5281/zenodo.18582609}{doi:10.5281/zenodo.18582609}.
+
+External data/product DOIs used by the underlying stack include:
+\begin{itemize}
+\item GWTC-3 products: \href{https://doi.org/10.1103/PhysRevX.13.041039}{doi:10.1103/PhysRevX.13.041039}.
+\item GLADE+: \href{https://doi.org/10.1093/mnras/stac1443}{doi:10.1093/mnras/stac1443}.
+\item Pantheon+ papers and dataset: \href{https://doi.org/10.3847/1538-4357/ac8b7a}{doi:10.3847/1538-4357/ac8b7a}, \href{https://doi.org/10.3847/1538-4357/ac8e04}{doi:10.3847/1538-4357/ac8e04}, \href{https://doi.org/10.5281/zenodo.16365279}{doi:10.5281/zenodo.16365279}.
+\item Cosmic-chronometer compilations: \href{https://doi.org/10.1088/1475-7516/2012/08/006}{doi:10.1088/1475-7516/2012/08/006}, \href{https://doi.org/10.1088/1475-7516/2016/05/014}{doi:10.1088/1475-7516/2016/05/014}.
+\item BOSS DR12 BAO+FS: \href{https://doi.org/10.1093/mnras/stx721}{doi:10.1093/mnras/stx721}.
+\item eBOSS DR16 LRG BAO+RSD: \href{https://doi.org/10.1093/mnras/staa2455}{doi:10.1093/mnras/staa2455}.
+\item DESI 2024 BAO analyses: \href{https://doi.org/10.1088/1475-7516/2025/04/012}{doi:10.1088/1475-7516/2025/04/012}, \href{https://doi.org/10.1088/1475-7516/2025/02/021}{doi:10.1088/1475-7516/2025/02/021}.
+\item Planck 2018 lensing: \href{https://doi.org/10.1051/0004-6361/201833886}{doi:10.1051/0004-6361/201833886}.
+\end{itemize}
+
+\section*{AI-use statement}
+AI systems were used extensively for software prototyping, experiment orchestration, diagnostics, and drafting/editing support in preparing this analysis package.
+
+\begin{thebibliography}{9}
+\bibitem{gwtc3}
+R.~Abbott \textit{et al.} (LIGO Scientific Collaboration, Virgo Collaboration, and KAGRA Collaboration),
+Phys. Rev. X \textbf{13}, 041039 (2023),
+\href{https://doi.org/10.1103/PhysRevX.13.041039}{doi:10.1103/PhysRevX.13.041039}.
+
+\bibitem{glade}
+G.~D\'alya \textit{et al.},
+Mon. Not. R. Astron. Soc. \textbf{514}, 1403 (2022),
+\href{https://doi.org/10.1093/mnras/stac1443}{doi:10.1093/mnras/stac1443}.
+\end{thebibliography}
+
+\end{document}
