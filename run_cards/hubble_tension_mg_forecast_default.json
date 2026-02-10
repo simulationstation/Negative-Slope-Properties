@@ -1,0 +1,21 @@
+{
+  "description": "Forecast Hubble-tension signatures assuming MG posterior truth from O3 run_dir.",
+  "script": "scripts/run_hubble_tension_mg_forecast.py",
+  "run_dir": "outputs/finalization/highpower_multistart_v2/M0_start101",
+  "draws": 4096,
+  "seed": 0,
+  "z_max": 0.62,
+  "z_n": 240,
+  "z_anchors": "0.2,0.35,0.5,0.62",
+  "n_rep": 5000,
+  "sigma_highz_frac": 0.01,
+  "local_mode": "external",
+  "h0_local_ref": 73.0,
+  "h0_local_sigma": 1.0,
+  "h0_planck_ref": 67.4,
+  "h0_planck_sigma": 0.5,
+  "omega_m_planck": 0.315,
+  "gr_omega_mode": "sample",
+  "gr_omega_fixed": 0.315,
+  "heartbeat_sec": 30
+}

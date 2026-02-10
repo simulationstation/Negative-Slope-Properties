@@ -1,0 +1,70 @@
+{
+  "name": "hubble_tension_mg_transfer_map_full_v1",
+  "purpose": "Quantify H0-tension relief fraction and GR-assumption sensitivity using the O3 five-seed MG posterior set.",
+  "launcher": "scripts/launch_hubble_tension_mg_robustness_grid_single_nohup.sh",
+  "phase": "full",
+  "out_root_template": "outputs/hubble_tension_mg_transfer_map_full_v1_<UTCSTAMP>",
+  "run_dirs": [
+    "outputs/finalization/highpower_multistart_v2/M0_start101",
+    "outputs/finalization/highpower_multistart_v2/M0_start202",
+    "outputs/finalization/highpower_multistart_v2/M0_start303",
+    "outputs/finalization/highpower_multistart_v2/M0_start404",
+    "outputs/finalization/highpower_multistart_v2/M0_start505"
+  ],
+  "grid_axes": {
+    "sigma_highz_fracs": [
+      0.005,
+      0.01,
+      0.02
+    ],
+    "h0_local_refs": [
+      72.0,
+      73.0,
+      74.0
+    ],
+    "local_modes": [
+      "external",
+      "truth"
+    ],
+    "gr_omega_modes": [
+      "sample",
+      "fixed"
+    ]
+  },
+  "inference_settings": {
+    "draws": 8192,
+    "n_rep": 20000,
+    "seed0": 1000,
+    "z_max": 0.62,
+    "z_n": 320,
+    "z_anchors": [
+      0.2,
+      0.35,
+      0.5,
+      0.62
+    ]
+  },
+  "references": {
+    "h0_local_sigma": 1.0,
+    "h0_planck_ref": 67.4,
+    "h0_planck_sigma": 0.5,
+    "omega_m_planck": 0.315,
+    "gr_omega_fixed": 0.315
+  },
+  "runtime": {
+    "cpuset_default": "0-(nproc-1)",
+    "omp_threads": 1,
+    "mkl_threads": 1,
+    "openblas_threads": 1,
+    "numexpr_threads": 1,
+    "heartbeat_sec": 30,
+    "resume": true
+  },
+  "artifacts": [
+    "grid_manifest.json",
+    "grid_progress.json",
+    "grid_results.csv",
+    "grid_summary.json",
+    "cases/*/tables/summary.json"
+  ]
+}
