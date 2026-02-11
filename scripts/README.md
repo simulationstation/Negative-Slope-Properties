@@ -1,6 +1,9 @@
 # Scripts
 
 - `run_realdata_recon.py`: end-to-end real-data pipeline + report
+- `run_horizon_anisotropy_scan.py`: directional sky scan (hemisphere, patch map, crossfit)
+- `run_horizon_anisotropy_production.py`: production orchestrator (crossfit + null shards + seed stability criteria)
+- `run_observable_only_slope_test.py`: observable-level `fσ8(z)` slope test (no `H(z)` inference)
 - `run_synthetic_closure.py`: generate mock data and validate recovery
 - `run_ablation_suite.py`: kernel/prior/covariance/domain ablations
 - `run_optical_bias_smoke.py`: optical-bias smoke test (mock or minimal)

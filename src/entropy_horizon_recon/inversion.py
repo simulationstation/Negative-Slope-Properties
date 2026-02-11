@@ -155,6 +155,7 @@ def infer_logmu_forward(
     sigma8_prior: tuple[float, float] = (0.6, 1.0),
     growth_mode: str = "ode",
     growth_gamma: float = 0.55,
+    growth_gamma_prior: tuple[float, float] | None = None,
     pk_bias_prior: tuple[float, float] = (0.5, 4.0),
     pk_noise_prior: tuple[float, float] = (0.0, 1.0e5),
     sigma_cc_jit_scale: float = 10.0,
@@ -399,9 +400,25 @@ def infer_logmu_forward(
     growth_mode_norm = str(growth_mode).strip().lower()
     if growth_mode_norm not in {"ode", "gamma"}:
         raise ValueError(f"Unsupported growth_mode '{growth_mode}'.")
-    growth_gamma = float(growth_gamma)
-    if not np.isfinite(growth_gamma) or growth_gamma <= 0.0:
+    growth_gamma_fixed = float(growth_gamma)
+    if not np.isfinite(growth_gamma_fixed) or growth_gamma_fixed <= 0.0:
         raise ValueError("growth_gamma must be positive and finite.")
+    free_growth_gamma = False
+    if growth_gamma_prior is not None:
+        if growth_mode_norm != "gamma":
+            raise ValueError("growth_gamma_prior requires growth_mode='gamma'.")
+        if not (growth_gamma_prior[1] > growth_gamma_prior[0]):
+            raise ValueError("growth_gamma_prior must satisfy hi > lo.")
+        gamma_lo = max(float(growth_gamma_prior[0]), 1e-6)
+        gamma_hi = float(growth_gamma_prior[1])
+        if not (np.isfinite(gamma_lo) and np.isfinite(gamma_hi) and gamma_hi > gamma_lo):
+            raise ValueError("growth_gamma_prior bounds must be finite and positive.")
+        free_growth_gamma = True
+        growth_gamma_lo_eff = gamma_lo
+        growth_gamma_hi_eff = gamma_hi
+    else:
+        growth_gamma_lo_eff = np.nan
+        growth_gamma_hi_eff = np.nan
 
     # Parameter layout (keep explicit for diagnostics).
     pos = 0
@@ -424,6 +441,10 @@ def infer_logmu_forward(
     idx_u_sigma8 = None
     if include_sigma8:
         idx_u_sigma8 = pos
+        pos += 1
+    idx_u_growth_gamma = None
+    if free_growth_gamma:
+        idx_u_growth_gamma = pos
         pos += 1
 
     idx_u_pk_b1: list[int] = []
@@ -457,6 +478,8 @@ def infer_logmu_forward(
         param_names.append("u_r_d")
     if idx_u_sigma8 is not None:
         param_names.append("u_sigma8")
+    if idx_u_growth_gamma is not None:
+        param_names.append("u_growth_gamma")
     if idx_u_pk_b1:
         for i in range(len(idx_u_pk_b1)):
             param_names.append(f"u_pk_b1_{i}")
@@ -666,6 +689,7 @@ def infer_logmu_forward(
         u_omega_k0 = float(theta[idx_u_omega_k0]) if idx_u_omega_k0 is not None else np.nan
         u_r_d = float(theta[idx_u_r_d]) if idx_u_r_d is not None else np.nan
         u_sigma8 = float(theta[idx_u_sigma8]) if idx_u_sigma8 is not None else np.nan
+        u_growth_gamma = float(theta[idx_u_growth_gamma]) if idx_u_growth_gamma is not None else np.nan
         u_pk_b1 = [float(theta[i]) for i in idx_u_pk_b1] if idx_u_pk_b1 else []
         u_pk_noise = [float(theta[i]) for i in idx_u_pk_noise] if idx_u_pk_noise else []
         log_sig_cc = float(theta[idx_log_sig_cc])
@@ -722,6 +746,15 @@ def infer_logmu_forward(
             lp += lp_s8
         else:
             sigma8_0 = np.nan
+        if idx_u_growth_gamma is not None:
+            growth_gamma_eff, lp_gamma = bounded_from_u(u_growth_gamma, growth_gamma_lo_eff, growth_gamma_hi_eff)
+            if not np.isfinite(growth_gamma_eff):
+                return -np.inf, "growth_gamma_nonfinite"
+            lp += lp_gamma
+        else:
+            growth_gamma_eff = float(growth_gamma_fixed)
+        if not np.isfinite(growth_gamma_eff) or growth_gamma_eff <= 0.0:
+            return -np.inf, "growth_gamma_nonpositive"
 
         pk_b1 = []
         pk_noise = []
@@ -802,6 +835,7 @@ def infer_logmu_forward(
         u_omega_k0 = float(theta[idx_u_omega_k0]) if idx_u_omega_k0 is not None else np.nan
         u_r_d = float(theta[idx_u_r_d]) if idx_u_r_d is not None else np.nan
         u_sigma8 = float(theta[idx_u_sigma8]) if idx_u_sigma8 is not None else np.nan
+        u_growth_gamma = float(theta[idx_u_growth_gamma]) if idx_u_growth_gamma is not None else np.nan
         u_pk_b1 = [float(theta[i]) for i in idx_u_pk_b1] if idx_u_pk_b1 else []
         u_pk_noise = [float(theta[i]) for i in idx_u_pk_noise] if idx_u_pk_noise else []
         log_sig_cc = float(theta[idx_log_sig_cc])
@@ -825,6 +859,10 @@ def infer_logmu_forward(
             sigma8_0, _ = bounded_from_u(u_sigma8, sigma8_prior[0], sigma8_prior[1])
         else:
             sigma8_0 = np.nan
+        if idx_u_growth_gamma is not None:
+            growth_gamma_eff, _ = bounded_from_u(u_growth_gamma, growth_gamma_lo_eff, growth_gamma_hi_eff)
+        else:
+            growth_gamma_eff = float(growth_gamma_fixed)
 
         pk_b1 = []
         pk_noise = []
@@ -853,6 +891,8 @@ def infer_logmu_forward(
             return -np.inf, {}, "r_d_nonfinite"
         if idx_u_sigma8 is not None and (not np.isfinite(sigma8_0) or sigma8_0 <= 0.0):
             return -np.inf, {}, "sigma8_nonfinite"
+        if not np.isfinite(growth_gamma_eff) or growth_gamma_eff <= 0.0:
+            return -np.inf, {}, "growth_gamma_nonpositive"
         if not np.isfinite(sig_cc) or sig_cc < 0.0:
             return -np.inf, {}, "sigma_cc_nonfinite"
         if not np.isfinite(sig_sn) or sig_sn < 0.0:
@@ -936,7 +976,7 @@ def infer_logmu_forward(
                     r_d_Mpc=r_d,
                     sigma8_0=float(sigma8_0),
                     growth_mode=growth_mode_norm,
-                    growth_gamma=float(growth_gamma),
+                    growth_gamma=float(growth_gamma_eff),
                 )
             except Exception:
                 return -np.inf, {}, f"fsbao_predict_failed:{fl.dataset}"
@@ -1061,7 +1101,7 @@ def infer_logmu_forward(
                     omega_k0=float(omega_k0),
                     sigma8_0=float(sigma8_0),
                     growth_mode=growth_mode_norm,
-                    growth_gamma=float(growth_gamma),
+                    growth_gamma=float(growth_gamma_eff),
                 )
                 ll_rsd = float(rsd_like.loglike(fs8_model))
             except Exception:
@@ -1125,6 +1165,7 @@ def infer_logmu_forward(
                 "omega_k0": omega_k0,
                 "r_d": r_d,
                 "sigma8_0": sigma8_0,
+                "growth_gamma": growth_gamma_eff,
                 "M_hat": M_hat,
                 "pk_b1": np.asarray(pk_b1, dtype=float) if pk_b1 else np.zeros((0,), dtype=float),
                 "pk_noise": np.asarray(pk_noise, dtype=float) if pk_noise else np.zeros((0,), dtype=float),
@@ -1189,6 +1230,10 @@ def infer_logmu_forward(
             sigma8_init = 0.5 * (sigma8_prior[0] + sigma8_prior[1])
             u_s8_0 = unbounded_from_bounded(sigma8_init, sigma8_prior[0], sigma8_prior[1])
             row[idx_u_sigma8] = u_s8_0 + rng.normal(scale=0.2)
+        if idx_u_growth_gamma is not None:
+            gamma_init = 0.5 * (growth_gamma_lo_eff + growth_gamma_hi_eff)
+            u_gamma_0 = unbounded_from_bounded(gamma_init, growth_gamma_lo_eff, growth_gamma_hi_eff)
+            row[idx_u_growth_gamma] = u_gamma_0 + rng.normal(scale=0.2)
         if idx_u_pk_b1:
             for ib1, inois in zip(idx_u_pk_b1, idx_u_pk_noise):
                 b1_init = 0.5 * (pk_bias_prior[0] + pk_bias_prior[1])
@@ -1358,6 +1403,10 @@ def infer_logmu_forward(
             s8_vals = sigma8_prior[0] + (sigma8_prior[1] - sigma8_prior[0]) * sigmoid(chain_3d[:, :, idx_u_sigma8])
             parts.append(s8_vals)
             names.append("sigma8_0")
+        if idx_u_growth_gamma is not None:
+            gamma_vals = growth_gamma_lo_eff + (growth_gamma_hi_eff - growth_gamma_lo_eff) * sigmoid(chain_3d[:, :, idx_u_growth_gamma])
+            parts.append(gamma_vals)
+            names.append("growth_gamma")
         if idx_u_pk_b1:
             for i, (ib1, inois) in enumerate(zip(idx_u_pk_b1, idx_u_pk_noise)):
                 b1_vals = pk_bias_prior[0] + (pk_bias_prior[1] - pk_bias_prior[0]) * sigmoid(chain_3d[:, :, ib1])
@@ -1783,6 +1832,7 @@ def infer_logmu_forward(
         rd_s = np.empty(draw_n)
         sigma8_s = np.empty(draw_n) if include_sigma8 else None
         S8_s = np.empty(draw_n) if include_sigma8 else None
+        gamma_s = np.empty(draw_n)
         sigcc_s = np.empty(draw_n)
         sigsn_s = np.empty(draw_n)
         sigd2_s = np.empty(draw_n)
@@ -1802,6 +1852,7 @@ def infer_logmu_forward(
             u_omega_k0 = float(th[idx_u_omega_k0]) if idx_u_omega_k0 is not None else np.nan
             u_r_d = float(th[idx_u_r_d]) if idx_u_r_d is not None else np.nan
             u_sigma8 = float(th[idx_u_sigma8]) if idx_u_sigma8 is not None else np.nan
+            u_growth_gamma = float(th[idx_u_growth_gamma]) if idx_u_growth_gamma is not None else np.nan
             u_pk_b1 = [float(th[i]) for i in idx_u_pk_b1] if idx_u_pk_b1 else []
             u_pk_noise = [float(th[i]) for i in idx_u_pk_noise] if idx_u_pk_noise else []
             log_sig_cc = float(th[idx_log_sig_cc])
@@ -1822,6 +1873,10 @@ def infer_logmu_forward(
                 sigma8_0, _ = bounded_from_u(u_sigma8, sigma8_prior[0], sigma8_prior[1])
             else:
                 sigma8_0 = np.nan
+            if idx_u_growth_gamma is not None:
+                growth_gamma_eff, _ = bounded_from_u(u_growth_gamma, growth_gamma_lo_eff, growth_gamma_hi_eff)
+            else:
+                growth_gamma_eff = float(growth_gamma_fixed)
             if pk_b1_s is not None and pk_noise_s is not None:
                 for i, (ub1, un) in enumerate(zip(u_pk_b1, u_pk_noise)):
                     pk_b1_s[j, i] = float(bounded_from_u(ub1, pk_bias_prior[0], pk_bias_prior[1])[0])
@@ -1851,6 +1906,7 @@ def infer_logmu_forward(
             H0_s[j] = H0
             Om_s[j] = float(omega_m0)
             Ok_s[j] = float(omega_k0)
+            gamma_s[j] = float(growth_gamma_eff)
             if sigma8_s is not None and S8_s is not None:
                 sigma8_s[j] = float(sigma8_0)
                 S8_s[j] = float(sigma8_0) * float(np.sqrt(float(omega_m0) / 0.3))
@@ -1909,7 +1965,11 @@ def infer_logmu_forward(
                 "r_d_fixed": float(r_d_fixed) if r_d_fixed is not None else None,
                 "sigma8_prior": tuple(float(x) for x in sigma8_prior) if include_sigma8 else None,
                 "growth_mode": str(growth_mode_norm),
-                "growth_gamma": float(growth_gamma),
+                "growth_gamma_fixed": float(growth_gamma_fixed),
+                "growth_gamma_prior": (
+                    tuple(float(x) for x in growth_gamma_prior) if growth_gamma_prior is not None else None
+                ),
+                "growth_gamma_is_free": bool(free_growth_gamma),
                 "sigma_cc_jit_scale": float(sigma_cc_jit_scale),
                 "sigma_sn_jit_scale": float(sigma_sn_jit_scale),
                 "logmu_knot_scale": float(logmu_knot_scale),
@@ -1935,6 +1995,7 @@ def infer_logmu_forward(
                 "omega_m0": Om_s,
                 "omega_k0": Ok_s,
                 "r_d_Mpc": rd_s,
+                "growth_gamma": gamma_s,
                 **({"sigma8_0": sigma8_s, "S8": S8_s} if include_sigma8 else {}),
                 "sigma_cc_jit": sigcc_s,
                 "sigma_sn_jit": sigsn_s,
