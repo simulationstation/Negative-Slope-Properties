@@ -75,6 +75,13 @@ This establishes stable, nonzero discrimination power for the mapping-choice gat
 \subsection{Hubble-scale anchors and robustness context}
 For transfer-map stress tests, we track the conventional anchor scales $H_0^{\rm Planck}=67.4\pm0.5$ and $H_0^{\rm local}=73.0\pm1.0$ km\,s$^{-1}$\,Mpc$^{-1}$ as external references. These anchors are used for sensitivity mapping, not as hard priors in the core area-law test, to preserve modified-gravity neutrality in the reconstruction stage.
 
+\subsection{Directional null test (Pantheon+ hemispheres and Planck lensing)}
+Because the entropy-current reconstruction is built from low-redshift geometry, it is important to check that the recovered trend is not dominated by a particular sky region or survey footprint. We therefore perform an explicit statistical-isotropy diagnostic using a hemisphere-split scan on the Pantheon+ sky: for each axis on a coarse HEALPix grid, we compute the slope-scar statistic $s$ separately in opposite hemispheres and form $\Delta s$ and its uncertainty.
+
+To suppress look-elsewhere effects, we use a five-fold crossfit procedure in which the ``best'' axis is chosen on a training split (maximizing $|\Delta s|/\sigma_{\Delta s}$) and then evaluated only once on held-out data. The held-out confirmations are consistent with noise, with fold-level $z_{\rm test}\in\{-0.354,-0.254,-0.028,+0.488,+0.065\}$ and a convenient aggregate diagnostic $z_{\rm Stouffer}\approx -0.037$.
+
+As an external cross-check, we evaluate a hemispherical Planck 2018 CMB lensing convergence variance statistic along the strongest training axis, finding $\Delta\log{\rm Var}(\kappa)\approx 0.032$ with a random-axis calibrated fixed-axis $p$-value $p\approx 0.22$ ($z\approx 1.23$). Within current sensitivity, these diagnostics provide no evidence for a robust dipolar modulation of the inferred slope statistic.
+
 \section{Discussion}
 The key physical output is not only ``negative slope detected,'' but what that slope means. A decreasing $\mu(A)$ implies that the effective entropy current changes as the Universe expands. In modified-gravity language this maps to an evolving effective Planck sector (running gravitational coupling), a known channel in scalar-tensor and $f(R)$-like effective descriptions.
 
