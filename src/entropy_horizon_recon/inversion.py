@@ -196,7 +196,8 @@ def infer_logmu_forward(
 
     # emcee uses tqdm for the progress bar. When stdout/stderr is a pipe (e.g. `... | tee`),
     # the reader can disappear, which raises BrokenPipeError and kills the run unless handled.
-    progress = bool(progress)
+    progress_requested = bool(progress)
+    progress = bool(progress_requested)
     try:
         if progress and hasattr(sys.stderr, "isatty") and not sys.stderr.isatty():
             progress = False
@@ -1343,6 +1344,12 @@ def infer_logmu_forward(
                 return sampler.run_mcmc(state, n_steps_to_run, progress=False)
         step = 0
         chunk = int(maxrss_check_every)
+        t_start = time.time()
+        # If the user requested progress but we're not showing a tqdm bar (e.g. stderr is not a TTY),
+        # emit occasional heartbeats so long runs don't look "hung".
+        heartbeat_enabled = bool(progress_requested) and not bool(show_progress)
+        heartbeat_every = max(int(chunk), int(max(50, n_steps_to_run // 20)))
+        next_heartbeat = int(heartbeat_every)
         while step < n_steps_to_run:
             n_chunk = min(chunk, n_steps_to_run - step)
             try:
@@ -1353,6 +1360,21 @@ def infer_logmu_forward(
                 show_progress = False
             step += n_chunk
             maybe_check_maxrss()
+            if heartbeat_enabled and step >= next_heartbeat:
+                dt = float(time.time() - t_start)
+                frac = float(step) / float(n_steps_to_run)
+                eta_s = None
+                if step > 0 and dt > 0:
+                    eta_s = dt * (float(n_steps_to_run - step) / float(step))
+                acc = float(np.mean(sampler.acceptance_fraction)) if sampler.acceptance_fraction is not None else float("nan")
+                if eta_s is None or not np.isfinite(eta_s):
+                    _safe_log(f"[emcee] progress: {step}/{n_steps_to_run} ({100.0*frac:.1f}%) elapsed={dt/60.0:.1f} min acc_mean={acc:.4f}")
+                else:
+                    _safe_log(
+                        f"[emcee] progress: {step}/{n_steps_to_run} ({100.0*frac:.1f}%) "
+                        f"elapsed={dt/60.0:.1f} min eta={eta_s/60.0:.1f} min acc_mean={acc:.4f}"
+                    )
+                next_heartbeat += int(heartbeat_every)
         return state
 
     def compute_min_ess_from_chain(

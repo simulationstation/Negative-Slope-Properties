@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +20,10 @@ def _utc_stamp() -> str:
 
 
 def _log(msg: str) -> None:
-    print(msg, flush=True)
+    try:
+        print(msg, flush=True)
+    except BrokenPipeError:
+        return
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -38,11 +43,96 @@ def _parse_seeds(text: str) -> list[int]:
     return out
 
 
-def _run(cmd: list[str], *, dry_run: bool) -> None:
-    _log(f"[run] {shlex.join(cmd)}")
+def _run(cmd: list[str], *, dry_run: bool, step_name: str, logs_dir: Path) -> None:
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / f"{step_name}.log"
+    crash_path = logs_dir / f"{step_name}.crash.txt"
+    meta_path = logs_dir / f"{step_name}.meta.json"
+
+    cmd_txt = shlex.join(cmd)
+    start_ts = _utc_stamp()
+    _log(f"[run] {cmd_txt}")
+    _write_json(
+        meta_path,
+        {
+            "step_name": step_name,
+            "status": "running",
+            "started_utc": start_ts,
+            "ended_utc": None,
+            "returncode": None,
+            "cmd": cmd,
+            "log_path": str(log_path),
+            "crash_path": str(crash_path),
+        },
+    )
     if dry_run:
+        _write_json(
+            meta_path,
+            {
+                "step_name": step_name,
+                "status": "dry_run",
+                "started_utc": start_ts,
+                "ended_utc": _utc_stamp(),
+                "returncode": 0,
+                "cmd": cmd,
+                "log_path": str(log_path),
+                "crash_path": str(crash_path),
+            },
+        )
         return
-    subprocess.run(cmd, check=True)
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["ANISO_CRASH_LOG"] = str(crash_path)
+    # Force this repo's `src/` ahead of any globally-installed checkout.
+    repo_root = Path(__file__).resolve().parents[1]
+    src_dir = repo_root / "src"
+    if src_dir.is_dir():
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(src_dir) if not existing else f"{src_dir}{os.pathsep}{existing}"
+
+    rc = None
+    with log_path.open("a", encoding="utf-8") as lf:
+        lf.write(f"\n=== {start_ts} START {step_name} ===\n")
+        lf.write(f"$ {cmd_txt}\n")
+        lf.flush()
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lf.write(line)
+            lf.flush()
+            _log(line.rstrip("\n"))
+        rc = int(proc.wait())
+        end_ts = _utc_stamp()
+        lf.write(f"=== {end_ts} END {step_name} rc={rc} ===\n")
+
+    status = "completed" if int(rc) == 0 else "failed"
+    _write_json(
+        meta_path,
+        {
+            "step_name": step_name,
+            "status": status,
+            "started_utc": start_ts,
+            "ended_utc": _utc_stamp(),
+            "returncode": int(rc),
+            "cmd": cmd,
+            "log_path": str(log_path),
+            "crash_path": str(crash_path),
+        },
+    )
+    if int(rc) != 0:
+        raise RuntimeError(
+            f"Step '{step_name}' failed (rc={rc}). "
+            f"See log: {log_path} "
+            f"and crash trace (if any): {crash_path}"
+        )
 
 
 def _lb_to_vec(l_deg: float, b_deg: float) -> np.ndarray:
@@ -160,6 +250,8 @@ def main() -> int:
         ],
     }
     _write_json(out_base / "acceptance_criteria.json", criteria)
+    logs_dir = out_base / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
 
     common = [
         args.python,
@@ -206,7 +298,16 @@ def main() -> int:
             "--train-axis-jobs",
             str(args.train_axis_jobs),
         ]
-        _run(crossfit_cmd, dry_run=bool(args.dry_run))
+        crossfit_summary_path = crossfit_out / "crossfit_summary.json"
+        if crossfit_summary_path.exists():
+            _log(f"[resume] seed={int(seed)} crossfit already complete at {crossfit_summary_path}")
+        else:
+            _run(
+                crossfit_cmd,
+                dry_run=bool(args.dry_run),
+                step_name=f"seed_{int(seed):04d}_crossfit",
+                logs_dir=logs_dir,
+            )
 
         shard_starts = list(range(0, int(args.null_reps), int(args.null_shard_size)))
         for rs in shard_starts:
@@ -229,7 +330,16 @@ def main() -> int:
                 "--null-rep-end",
                 str(re),
             ]
-            _run(null_cmd, dry_run=bool(args.dry_run))
+            shard_marker = hemi_out / f"null_shard_{int(rs):04d}_{int(re):04d}.json"
+            if shard_marker.exists():
+                _log(f"[resume] seed={int(seed)} null shard {rs}:{re} already complete")
+            else:
+                _run(
+                    null_cmd,
+                    dry_run=bool(args.dry_run),
+                    step_name=f"seed_{int(seed):04d}_null_{int(rs):04d}_{int(re):04d}",
+                    logs_dir=logs_dir,
+                )
 
         finalize_cmd = common + [
             "--mode",
@@ -246,7 +356,16 @@ def main() -> int:
             str(args.null_reps),
             "--null-finalize-only",
         ]
-        _run(finalize_cmd, dry_run=bool(args.dry_run))
+        null_summary_path = hemi_out / "null_summary.json"
+        if null_summary_path.exists():
+            _log(f"[resume] seed={int(seed)} null finalize already complete at {null_summary_path}")
+        else:
+            _run(
+                finalize_cmd,
+                dry_run=bool(args.dry_run),
+                step_name=f"seed_{int(seed):04d}_null_finalize",
+                logs_dir=logs_dir,
+            )
 
         if bool(args.dry_run):
             continue
@@ -308,4 +427,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception:
+        print(traceback.format_exc(), file=sys.stderr, flush=True)
+        raise

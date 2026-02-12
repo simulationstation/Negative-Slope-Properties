@@ -6,11 +6,20 @@ import contextlib
 import json
 import math
 import os
+import sys
 import tempfile
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+# Ensure this repo's `src/` is importable even if another checkout/version of
+# `entropy_horizon_recon` is installed in the environment.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC_DIR = _REPO_ROOT / "src"
+if _SRC_DIR.is_dir():
+    sys.path.insert(0, str(_SRC_DIR))
 
 import healpy as hp
 import numpy as np
@@ -30,7 +39,11 @@ def _utc_stamp() -> str:
 
 def _log(msg: str) -> None:
     # Keep logs visible in nohup+run.log (when PYTHONUNBUFFERED=1).
-    print(msg, flush=True)
+    # If stdout is a broken pipe (e.g. reader disappeared), keep the run alive.
+    try:
+        print(msg, flush=True)
+    except BrokenPipeError:
+        return
 
 
 def _json_default(obj: Any):
@@ -355,9 +368,18 @@ def _apply_production_preset(args: argparse.Namespace) -> None:
     args.test_parallel_fore_aft = True
     args.store_axis_posteriors = False
     args.store_train_posteriors = False
+    # ptemcee multiplies likelihood calls by ~pt_ntemps; for large directional scans
+    # it is the dominant bottleneck. Default production runs to emcee for throughput.
+    args.mu_sampler = "emcee"
     # Treat gamma as a sampled nuisance instead of fixed GR-calibrated value.
     args.growth_mode = "gamma"
     args.growth_gamma_free = True
+    # Train scans are a many-axis ranking stage; default to a cheaper sampler unless
+    # the user explicitly overrides it.
+    if str(getattr(args, "train_mu_sampler", "inherit")) == "inherit":
+        args.train_mu_sampler = "emcee"
+    if int(getattr(args, "train_mu_walkers", 0)) <= 0:
+        args.train_mu_walkers = 24
     # Ensure enough axis tasks to keep axis-level workers busy.
     hemi_jobs = max(int(getattr(args, "axis_jobs", 0)), int(getattr(args, "null_axis_jobs", 0)))
     if hemi_jobs > 0:
@@ -659,6 +681,9 @@ def _infer_subset_s_stats(
     sigma_d2_scale: float,
     logmu_knot_scale: float | None,
     m_weight_mode: str,
+    debug_log_path: str | Path | None = None,
+    timing_log_path: str | Path | None = None,
+    timing_every: int = 200,
     quiet: bool = False,
 ) -> tuple[float, float]:
     """Ephemeral SN-only inference returning only (s_mean, s_std).
@@ -741,6 +766,9 @@ def _infer_subset_s_stats(
             sigma_d2_scale=float(sigma_d2_scale),
             logmu_knot_scale=float(logmu_knot_scale) if logmu_knot_scale is not None else 1.0,
             progress=False,
+            debug_log_path=debug_log_path,
+            timing_log_path=timing_log_path,
+            timing_every=int(timing_every),
         )
 
     if quiet:
@@ -1182,187 +1210,257 @@ def _train_axis_worker(task: _TrainAxisTask) -> dict[str, Any] | None:
         except Exception:
             pass
 
-    proj = v[train_idx] @ vec
-    idx_fore = train_idx[np.where(proj > 0.0)[0]].astype(np.int64)
-    idx_aft = train_idx[np.where(proj < 0.0)[0]].astype(np.int64)
-    zmatch_meta: dict[str, Any] | None = None
+    status_path = axis_dir / "worker_status.json"
+    error_path = axis_dir / "worker_error.json"
 
-    if str(args.match_z) == "bin_downsample":
-        mr = int(args.min_sn_per_side)
-        if str(args.match_mode) == "survey_z":
-            rng_match = np.random.default_rng(
-                _seed_for_match(base_seed=base_seed, fold=int(task.fold), axis_pix=int(p), stage="train", mode="survey_z", min_req=mr)
+    def _status(state: str, **extra: Any) -> None:
+        axis_dir.mkdir(parents=True, exist_ok=True)
+        payload: dict[str, Any] = {
+            "state": str(state),
+            "timestamp_utc": _utc_stamp(),
+            "epoch_s": float(time.time()),
+            "pid": int(os.getpid()),
+            "fold": int(task.fold),
+            "axis_pix": int(p),
+            "axis_l_deg": float(l_deg),
+            "axis_b_deg": float(b_deg),
+        }
+        payload.update(extra)
+        _write_json(status_path, payload)
+
+    try:
+        _status("started")
+
+        proj = v[train_idx] @ vec
+        idx_fore = train_idx[np.where(proj > 0.0)[0]].astype(np.int64)
+        idx_aft = train_idx[np.where(proj < 0.0)[0]].astype(np.int64)
+        zmatch_meta: dict[str, Any] | None = None
+
+        if str(args.match_z) == "bin_downsample":
+            mr = int(args.min_sn_per_side)
+            if str(args.match_mode) == "survey_z":
+                rng_match = np.random.default_rng(
+                    _seed_for_match(base_seed=base_seed, fold=int(task.fold), axis_pix=int(p), stage="train", mode="survey_z", min_req=mr)
+                )
+                idx_fore, idx_aft, zmatch_meta = _match_fore_aft_by_group(idx_fore, idx_aft, group_key=group_key, rng=rng_match)
+            else:
+                if z_edges is None:
+                    raise RuntimeError("z_edges missing for z_only matching")
+                rng_match = np.random.default_rng(_seed_for_match(base_seed=base_seed, fold=int(task.fold), axis_pix=int(p), stage="train", mode="z_bin", min_req=mr))
+                idx_fore, idx_aft, zmatch_meta = _match_z_binwise(idx_fore, idx_aft, z, z_edges=z_edges, rng=rng_match)
+
+        _status("matched", n_fore=int(idx_fore.size), n_aft=int(idx_aft.size))
+        if int(idx_fore.size) < int(args.min_sn_per_side) or int(idx_aft.size) < int(args.min_sn_per_side):
+            _status("skipped_min_sn", min_sn_per_side=int(args.min_sn_per_side), n_fore=int(idx_fore.size), n_aft=int(idx_aft.size))
+            return None
+
+        axis_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(axis_dir / "axis.json", {"axis_pix": int(p), "l_deg": float(l_deg), "b_deg": float(b_deg), "match": zmatch_meta})
+
+        if bool(getattr(args, "store_train_posteriors", False)):
+            _status("fore_recon_start", n_fore=int(idx_fore.size))
+            fore = _run_subset_recon(
+                out_dir=axis_dir / "fore",
+                sn_z=z[idx_fore],
+                sn_m=m[idx_fore],
+                sn_cov=cov[np.ix_(idx_fore, idx_fore)],
+                z_min=float(g["z_min"]),
+                z_max=float(g["z_max"]),
+                sn_like_bin_width=float(args.sn_like_bin_width),
+                sn_like_min_per_bin=int(args.sn_like_min_per_bin),
+                mu_knots=int(args.train_mu_knots),
+                mu_grid=int(args.mu_grid),
+                n_grid=int(args.n_grid),
+                mu_sampler=str(g["train_mu_sampler"]),
+                pt_ntemps=int(g["train_pt_ntemps"]),
+                pt_tmax=float(g["train_pt_tmax"]) if g["train_pt_tmax"] is not None else None,
+                mu_walkers=int(g["train_mu_walkers"]),
+                mu_steps=int(args.train_mu_steps),
+                mu_burn=int(args.train_mu_burn),
+                mu_draws=int(args.train_mu_draws),
+                mu_procs=int(g["train_mu_procs"]),
+                seed=base_seed + 10_000 * int(task.fold) + int(p) + 111,
+                omega_m0_prior=(float(args.omega_m0_prior[0]), float(args.omega_m0_prior[1])),
+                H0_prior=(float(args.H0_prior[0]), float(args.H0_prior[1])),
+                r_d_fixed=float(args.r_d_fixed),
+                growth_mode=str(args.growth_mode),
+                growth_gamma=float(args.growth_gamma),
+                growth_gamma_prior=_growth_gamma_prior_from_args(args),
+                sigma_sn_jit_scale=float(args.sigma_sn_jit_scale),
+                sigma_d2_scale=float(args.sigma_d2_scale),
+                logmu_knot_scale=float(args.logmu_knot_scale) if args.logmu_knot_scale is not None else None,
+                m_weight_mode=str(args.m_weight_mode),
+                quiet=bool(g["train_quiet"]),
             )
-            idx_fore, idx_aft, zmatch_meta = _match_fore_aft_by_group(idx_fore, idx_aft, group_key=group_key, rng=rng_match)
+            _status("fore_recon_done")
+            _status("aft_recon_start", n_aft=int(idx_aft.size))
+            aft = _run_subset_recon(
+                out_dir=axis_dir / "aft",
+                sn_z=z[idx_aft],
+                sn_m=m[idx_aft],
+                sn_cov=cov[np.ix_(idx_aft, idx_aft)],
+                z_min=float(g["z_min"]),
+                z_max=float(g["z_max"]),
+                sn_like_bin_width=float(args.sn_like_bin_width),
+                sn_like_min_per_bin=int(args.sn_like_min_per_bin),
+                mu_knots=int(args.train_mu_knots),
+                mu_grid=int(args.mu_grid),
+                n_grid=int(args.n_grid),
+                mu_sampler=str(g["train_mu_sampler"]),
+                pt_ntemps=int(g["train_pt_ntemps"]),
+                pt_tmax=float(g["train_pt_tmax"]) if g["train_pt_tmax"] is not None else None,
+                mu_walkers=int(g["train_mu_walkers"]),
+                mu_steps=int(args.train_mu_steps),
+                mu_burn=int(args.train_mu_burn),
+                mu_draws=int(args.train_mu_draws),
+                mu_procs=int(g["train_mu_procs"]),
+                seed=base_seed + 10_000 * int(task.fold) + int(p) + 222,
+                omega_m0_prior=(float(args.omega_m0_prior[0]), float(args.omega_m0_prior[1])),
+                H0_prior=(float(args.H0_prior[0]), float(args.H0_prior[1])),
+                r_d_fixed=float(args.r_d_fixed),
+                growth_mode=str(args.growth_mode),
+                growth_gamma=float(args.growth_gamma),
+                growth_gamma_prior=_growth_gamma_prior_from_args(args),
+                sigma_sn_jit_scale=float(args.sigma_sn_jit_scale),
+                sigma_d2_scale=float(args.sigma_d2_scale),
+                logmu_knot_scale=float(args.logmu_knot_scale) if args.logmu_knot_scale is not None else None,
+                m_weight_mode=str(args.m_weight_mode),
+                quiet=bool(g["train_quiet"]),
+            )
+            _status("aft_recon_done")
+
+            s_f_mean = float(fore["departure"]["slope"]["mean"])
+            s_f_std = float(fore["departure"]["slope"]["std"])
+            s_a_mean = float(aft["departure"]["slope"]["mean"])
+            s_a_std = float(aft["departure"]["slope"]["std"])
         else:
-            if z_edges is None:
-                raise RuntimeError("z_edges missing for z_only matching")
-            rng_match = np.random.default_rng(_seed_for_match(base_seed=base_seed, fold=int(task.fold), axis_pix=int(p), stage="train", mode="z_bin", min_req=mr))
-            idx_fore, idx_aft, zmatch_meta = _match_z_binwise(idx_fore, idx_aft, z, z_edges=z_edges, rng=rng_match)
-
-    if int(idx_fore.size) < int(args.min_sn_per_side) or int(idx_aft.size) < int(args.min_sn_per_side):
-        return None
-
-    axis_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(axis_dir / "axis.json", {"axis_pix": int(p), "l_deg": float(l_deg), "b_deg": float(b_deg), "match": zmatch_meta})
-
-    if bool(getattr(args, "store_train_posteriors", False)):
-        fore = _run_subset_recon(
-            out_dir=axis_dir / "fore",
-            sn_z=z[idx_fore],
-            sn_m=m[idx_fore],
-            sn_cov=cov[np.ix_(idx_fore, idx_fore)],
-            z_min=float(g["z_min"]),
-            z_max=float(g["z_max"]),
-            sn_like_bin_width=float(args.sn_like_bin_width),
-            sn_like_min_per_bin=int(args.sn_like_min_per_bin),
-            mu_knots=int(args.train_mu_knots),
-            mu_grid=int(args.mu_grid),
-            n_grid=int(args.n_grid),
-            mu_sampler=str(g["train_mu_sampler"]),
-            pt_ntemps=int(g["train_pt_ntemps"]),
-            pt_tmax=float(g["train_pt_tmax"]) if g["train_pt_tmax"] is not None else None,
-            mu_walkers=int(g["train_mu_walkers"]),
-            mu_steps=int(args.train_mu_steps),
-            mu_burn=int(args.train_mu_burn),
-            mu_draws=int(args.train_mu_draws),
-            mu_procs=int(g["train_mu_procs"]),
-            seed=base_seed + 10_000 * int(task.fold) + int(p) + 111,
-            omega_m0_prior=(float(args.omega_m0_prior[0]), float(args.omega_m0_prior[1])),
-            H0_prior=(float(args.H0_prior[0]), float(args.H0_prior[1])),
-            r_d_fixed=float(args.r_d_fixed),
-            growth_mode=str(args.growth_mode),
-            growth_gamma=float(args.growth_gamma),
-            growth_gamma_prior=_growth_gamma_prior_from_args(args),
-            sigma_sn_jit_scale=float(args.sigma_sn_jit_scale),
-            sigma_d2_scale=float(args.sigma_d2_scale),
-            logmu_knot_scale=float(args.logmu_knot_scale) if args.logmu_knot_scale is not None else None,
-            m_weight_mode=str(args.m_weight_mode),
-            quiet=bool(g["train_quiet"]),
+            _status("fore_stats_start", n_fore=int(idx_fore.size))
+            s_f_mean, s_f_std = _infer_subset_s_stats(
+                sn_z=z[idx_fore],
+                sn_m=m[idx_fore],
+                sn_cov=cov[np.ix_(idx_fore, idx_fore)],
+                z_min=float(g["z_min"]),
+                z_max=float(g["z_max"]),
+                sn_like_bin_width=float(args.sn_like_bin_width),
+                sn_like_min_per_bin=int(args.sn_like_min_per_bin),
+                mu_knots=int(args.train_mu_knots),
+                mu_grid=int(args.mu_grid),
+                n_grid=int(args.n_grid),
+                mu_sampler=str(g["train_mu_sampler"]),
+                pt_ntemps=int(g["train_pt_ntemps"]),
+                pt_tmax=float(g["train_pt_tmax"]) if g["train_pt_tmax"] is not None else None,
+                mu_walkers=int(g["train_mu_walkers"]),
+                mu_steps=int(args.train_mu_steps),
+                mu_burn=int(args.train_mu_burn),
+                mu_draws=int(args.train_mu_draws),
+                mu_procs=int(g["train_mu_procs"]),
+                seed=base_seed + 10_000 * int(task.fold) + int(p) + 111,
+                omega_m0_prior=(float(args.omega_m0_prior[0]), float(args.omega_m0_prior[1])),
+                H0_prior=(float(args.H0_prior[0]), float(args.H0_prior[1])),
+                r_d_fixed=float(args.r_d_fixed),
+                growth_mode=str(args.growth_mode),
+                growth_gamma=float(args.growth_gamma),
+                growth_gamma_prior=_growth_gamma_prior_from_args(args),
+                sigma_sn_jit_scale=float(args.sigma_sn_jit_scale),
+                sigma_d2_scale=float(args.sigma_d2_scale),
+                logmu_knot_scale=float(args.logmu_knot_scale) if args.logmu_knot_scale is not None else None,
+                m_weight_mode=str(args.m_weight_mode),
+                debug_log_path=str(axis_dir / "fore_stats_invalid.jsonl"),
+                timing_log_path=str(axis_dir / "fore_stats_timing.jsonl"),
+                quiet=bool(g["train_quiet"]),
+            )
+            _status("fore_stats_done")
+            _status("aft_stats_start", n_aft=int(idx_aft.size))
+            s_a_mean, s_a_std = _infer_subset_s_stats(
+                sn_z=z[idx_aft],
+                sn_m=m[idx_aft],
+                sn_cov=cov[np.ix_(idx_aft, idx_aft)],
+                z_min=float(g["z_min"]),
+                z_max=float(g["z_max"]),
+                sn_like_bin_width=float(args.sn_like_bin_width),
+                sn_like_min_per_bin=int(args.sn_like_min_per_bin),
+                mu_knots=int(args.train_mu_knots),
+                mu_grid=int(args.mu_grid),
+                n_grid=int(args.n_grid),
+                mu_sampler=str(g["train_mu_sampler"]),
+                pt_ntemps=int(g["train_pt_ntemps"]),
+                pt_tmax=float(g["train_pt_tmax"]) if g["train_pt_tmax"] is not None else None,
+                mu_walkers=int(g["train_mu_walkers"]),
+                mu_steps=int(args.train_mu_steps),
+                mu_burn=int(args.train_mu_burn),
+                mu_draws=int(args.train_mu_draws),
+                mu_procs=int(g["train_mu_procs"]),
+                seed=base_seed + 10_000 * int(task.fold) + int(p) + 222,
+                omega_m0_prior=(float(args.omega_m0_prior[0]), float(args.omega_m0_prior[1])),
+                H0_prior=(float(args.H0_prior[0]), float(args.H0_prior[1])),
+                r_d_fixed=float(args.r_d_fixed),
+                growth_mode=str(args.growth_mode),
+                growth_gamma=float(args.growth_gamma),
+                growth_gamma_prior=_growth_gamma_prior_from_args(args),
+                sigma_sn_jit_scale=float(args.sigma_sn_jit_scale),
+                sigma_d2_scale=float(args.sigma_d2_scale),
+                logmu_knot_scale=float(args.logmu_knot_scale) if args.logmu_knot_scale is not None else None,
+                m_weight_mode=str(args.m_weight_mode),
+                debug_log_path=str(axis_dir / "aft_stats_invalid.jsonl"),
+                timing_log_path=str(axis_dir / "aft_stats_timing.jsonl"),
+                quiet=bool(g["train_quiet"]),
+            )
+            _status("aft_stats_done")
+        delta_s = s_f_mean - s_a_mean
+        sig = math.sqrt(max(s_f_std**2 + s_a_std**2, 1e-12))
+        z_sc = float(delta_s / sig)
+        ar = AxisResult(
+            axis_pix=int(p),
+            axis_l_deg=float(l_deg),
+            axis_b_deg=float(b_deg),
+            n_fore=int(idx_fore.size),
+            n_aft=int(idx_aft.size),
+            s_fore_mean=s_f_mean,
+            s_fore_std=s_f_std,
+            s_aft_mean=s_a_mean,
+            s_aft_std=s_a_std,
+            delta_s=float(delta_s),
+            sigma_delta_s=float(sig),
+            z_score=z_sc,
         )
-        aft = _run_subset_recon(
-            out_dir=axis_dir / "aft",
-            sn_z=z[idx_aft],
-            sn_m=m[idx_aft],
-            sn_cov=cov[np.ix_(idx_aft, idx_aft)],
-            z_min=float(g["z_min"]),
-            z_max=float(g["z_max"]),
-            sn_like_bin_width=float(args.sn_like_bin_width),
-            sn_like_min_per_bin=int(args.sn_like_min_per_bin),
-            mu_knots=int(args.train_mu_knots),
-            mu_grid=int(args.mu_grid),
-            n_grid=int(args.n_grid),
-            mu_sampler=str(g["train_mu_sampler"]),
-            pt_ntemps=int(g["train_pt_ntemps"]),
-            pt_tmax=float(g["train_pt_tmax"]) if g["train_pt_tmax"] is not None else None,
-            mu_walkers=int(g["train_mu_walkers"]),
-            mu_steps=int(args.train_mu_steps),
-            mu_burn=int(args.train_mu_burn),
-            mu_draws=int(args.train_mu_draws),
-            mu_procs=int(g["train_mu_procs"]),
-            seed=base_seed + 10_000 * int(task.fold) + int(p) + 222,
-            omega_m0_prior=(float(args.omega_m0_prior[0]), float(args.omega_m0_prior[1])),
-            H0_prior=(float(args.H0_prior[0]), float(args.H0_prior[1])),
-            r_d_fixed=float(args.r_d_fixed),
-            growth_mode=str(args.growth_mode),
-            growth_gamma=float(args.growth_gamma),
-            growth_gamma_prior=_growth_gamma_prior_from_args(args),
-            sigma_sn_jit_scale=float(args.sigma_sn_jit_scale),
-            sigma_d2_scale=float(args.sigma_d2_scale),
-            logmu_knot_scale=float(args.logmu_knot_scale) if args.logmu_knot_scale is not None else None,
-            m_weight_mode=str(args.m_weight_mode),
-            quiet=bool(g["train_quiet"]),
-        )
-
-        s_f_mean = float(fore["departure"]["slope"]["mean"])
-        s_f_std = float(fore["departure"]["slope"]["std"])
-        s_a_mean = float(aft["departure"]["slope"]["mean"])
-        s_a_std = float(aft["departure"]["slope"]["std"])
-    else:
-        s_f_mean, s_f_std = _infer_subset_s_stats(
-            sn_z=z[idx_fore],
-            sn_m=m[idx_fore],
-            sn_cov=cov[np.ix_(idx_fore, idx_fore)],
-            z_min=float(g["z_min"]),
-            z_max=float(g["z_max"]),
-            sn_like_bin_width=float(args.sn_like_bin_width),
-            sn_like_min_per_bin=int(args.sn_like_min_per_bin),
-            mu_knots=int(args.train_mu_knots),
-            mu_grid=int(args.mu_grid),
-            n_grid=int(args.n_grid),
-            mu_sampler=str(g["train_mu_sampler"]),
-            pt_ntemps=int(g["train_pt_ntemps"]),
-            pt_tmax=float(g["train_pt_tmax"]) if g["train_pt_tmax"] is not None else None,
-            mu_walkers=int(g["train_mu_walkers"]),
-            mu_steps=int(args.train_mu_steps),
-            mu_burn=int(args.train_mu_burn),
-            mu_draws=int(args.train_mu_draws),
-            mu_procs=int(g["train_mu_procs"]),
-            seed=base_seed + 10_000 * int(task.fold) + int(p) + 111,
-            omega_m0_prior=(float(args.omega_m0_prior[0]), float(args.omega_m0_prior[1])),
-            H0_prior=(float(args.H0_prior[0]), float(args.H0_prior[1])),
-            r_d_fixed=float(args.r_d_fixed),
-            growth_mode=str(args.growth_mode),
-            growth_gamma=float(args.growth_gamma),
-            growth_gamma_prior=_growth_gamma_prior_from_args(args),
-            sigma_sn_jit_scale=float(args.sigma_sn_jit_scale),
-            sigma_d2_scale=float(args.sigma_d2_scale),
-            logmu_knot_scale=float(args.logmu_knot_scale) if args.logmu_knot_scale is not None else None,
-            m_weight_mode=str(args.m_weight_mode),
-            quiet=bool(g["train_quiet"]),
-        )
-        s_a_mean, s_a_std = _infer_subset_s_stats(
-            sn_z=z[idx_aft],
-            sn_m=m[idx_aft],
-            sn_cov=cov[np.ix_(idx_aft, idx_aft)],
-            z_min=float(g["z_min"]),
-            z_max=float(g["z_max"]),
-            sn_like_bin_width=float(args.sn_like_bin_width),
-            sn_like_min_per_bin=int(args.sn_like_min_per_bin),
-            mu_knots=int(args.train_mu_knots),
-            mu_grid=int(args.mu_grid),
-            n_grid=int(args.n_grid),
-            mu_sampler=str(g["train_mu_sampler"]),
-            pt_ntemps=int(g["train_pt_ntemps"]),
-            pt_tmax=float(g["train_pt_tmax"]) if g["train_pt_tmax"] is not None else None,
-            mu_walkers=int(g["train_mu_walkers"]),
-            mu_steps=int(args.train_mu_steps),
-            mu_burn=int(args.train_mu_burn),
-            mu_draws=int(args.train_mu_draws),
-            mu_procs=int(g["train_mu_procs"]),
-            seed=base_seed + 10_000 * int(task.fold) + int(p) + 222,
-            omega_m0_prior=(float(args.omega_m0_prior[0]), float(args.omega_m0_prior[1])),
-            H0_prior=(float(args.H0_prior[0]), float(args.H0_prior[1])),
-            r_d_fixed=float(args.r_d_fixed),
-            growth_mode=str(args.growth_mode),
-            growth_gamma=float(args.growth_gamma),
-            growth_gamma_prior=_growth_gamma_prior_from_args(args),
-            sigma_sn_jit_scale=float(args.sigma_sn_jit_scale),
-            sigma_d2_scale=float(args.sigma_d2_scale),
-            logmu_knot_scale=float(args.logmu_knot_scale) if args.logmu_knot_scale is not None else None,
-            m_weight_mode=str(args.m_weight_mode),
-            quiet=bool(g["train_quiet"]),
-        )
-    delta_s = s_f_mean - s_a_mean
-    sig = math.sqrt(max(s_f_std**2 + s_a_std**2, 1e-12))
-    z_sc = float(delta_s / sig)
-    ar = AxisResult(
-        axis_pix=int(p),
-        axis_l_deg=float(l_deg),
-        axis_b_deg=float(b_deg),
-        n_fore=int(idx_fore.size),
-        n_aft=int(idx_aft.size),
-        s_fore_mean=s_f_mean,
-        s_fore_std=s_f_std,
-        s_aft_mean=s_a_mean,
-        s_aft_std=s_a_std,
-        delta_s=float(delta_s),
-        sigma_delta_s=float(sig),
-        z_score=z_sc,
-    )
-    out = asdict(ar)
-    _write_json(axis_dir / "result.json", out)
-    return out
+        out = asdict(ar)
+        _write_json(axis_dir / "result.json", out)
+        _status("done", delta_s=float(delta_s), sigma_delta_s=float(sig), z_score=float(z_sc))
+        try:
+            error_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return out
+    except Exception as e:
+        tb = traceback.format_exc()
+        try:
+            axis_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(
+                error_path,
+                {
+                    "timestamp_utc": _utc_stamp(),
+                    "pid": int(os.getpid()),
+                    "fold": int(task.fold),
+                    "axis_pix": int(p),
+                    "axis_l_deg": float(l_deg),
+                    "axis_b_deg": float(b_deg),
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                    "traceback": tb,
+                },
+            )
+            _status("error", error_type=type(e).__name__, error=str(e))
+        except Exception:
+            pass
+        return {
+            "_worker_error": True,
+            "fold": int(task.fold),
+            "axis_pix": int(p),
+            "axis_l_deg": float(l_deg),
+            "axis_b_deg": float(b_deg),
+            "error_type": type(e).__name__,
+            "error": str(e),
+        }
 
 
 def _fit_dipole_from_deltas(vecs: np.ndarray, y: np.ndarray, sigma: np.ndarray) -> dict[str, Any]:
@@ -1862,38 +1960,91 @@ def main() -> int:
                 }
 
                 t0 = time.time()
+                progress_every = max(1, int(len(tasks) // 12))
+                n_skipped = 0
+                n_errors = 0
                 if train_axis_jobs > 1:
                     import multiprocessing as mp
 
                     ctx = mp.get_context("fork")
                     _log(f"[crossfit][train] fold={k} parallel axis scan: jobs={train_axis_jobs} tasks={len(tasks)} train_mu_procs={train_mu_procs}")
                     with ctx.Pool(processes=int(train_axis_jobs)) as pool:
-                        for j, out in enumerate(pool.imap_unordered(_train_axis_worker, tasks, chunksize=1), start=1):
-                            if out is None:
-                                continue
+                        it = pool.imap_unordered(_train_axis_worker, tasks, chunksize=1)
+                        done = 0
+                        while done < len(tasks):
                             try:
-                                train_axis_rows.append(_axisresult_from_dict(out))
-                                train_rows_json.append(dict(out))
-                            except Exception:
-                                continue
-                            if j % 10 == 0:
+                                out = it.next(timeout=60.0)
+                            except mp.TimeoutError:
                                 dt = time.time() - t0
-                                _log(f"[crossfit][train] fold={k} collected={len(train_axis_rows)} elapsed={dt/60:.1f} min")
+                                n_status = int(sum(1 for _ in train_scan_dir.glob("axis_*/worker_status.json")))
+                                n_done = int(sum(1 for _ in train_scan_dir.glob("axis_*/result.json")))
+                                n_err = int(sum(1 for _ in train_scan_dir.glob("axis_*/worker_error.json")))
+                                _log(
+                                    f"[crossfit][train] fold={k} heartbeat: done={done}/{len(tasks)} "
+                                    f"results={n_done} status={n_status} errors={n_err} elapsed={dt/60:.1f} min"
+                                )
+                                continue
+
+                            done += 1
+                            if out is None:
+                                n_skipped += 1
+                            elif isinstance(out, dict) and bool(out.get("_worker_error", False)):
+                                n_errors += 1
+                                _log(
+                                    f"[crossfit][train] fold={k} axis worker error pix={out.get('axis_pix')} "
+                                    f"{out.get('error_type')}: {out.get('error')}"
+                                )
+                            else:
+                                try:
+                                    train_axis_rows.append(_axisresult_from_dict(out))
+                                    train_rows_json.append(dict(out))
+                                except Exception as e:
+                                    n_errors += 1
+                                    _log(f"[crossfit][train] fold={k} malformed worker payload: {type(e).__name__}: {e}")
+
+                            if done % progress_every == 0 or done == len(tasks):
+                                dt = time.time() - t0
+                                _write_json(train_scan_dir / "axis_results.partial.json", train_rows_json)
+                                _log(
+                                    f"[crossfit][train] fold={k} progress done={done}/{len(tasks)} "
+                                    f"kept={len(train_axis_rows)} skipped={n_skipped} errors={n_errors} "
+                                    f"elapsed={dt/60:.1f} min"
+                                )
                 else:
                     for j, tsk in enumerate(tasks, start=1):
                         out = _train_axis_worker(tsk)
                         if out is None:
-                            continue
-                        train_axis_rows.append(_axisresult_from_dict(out))
-                        train_rows_json.append(dict(out))
-                        if j % 10 == 0:
+                            n_skipped += 1
+                        elif isinstance(out, dict) and bool(out.get("_worker_error", False)):
+                            n_errors += 1
+                            _log(
+                                f"[crossfit][train] fold={k} axis worker error pix={out.get('axis_pix')} "
+                                f"{out.get('error_type')}: {out.get('error')}"
+                            )
+                        else:
+                            try:
+                                train_axis_rows.append(_axisresult_from_dict(out))
+                                train_rows_json.append(dict(out))
+                            except Exception as e:
+                                n_errors += 1
+                                _log(f"[crossfit][train] fold={k} malformed worker payload: {type(e).__name__}: {e}")
+
+                        if j % progress_every == 0 or j == len(tasks):
                             dt = time.time() - t0
-                            _log(f"[crossfit][train] fold={k} collected={len(train_axis_rows)} elapsed={dt/60:.1f} min")
+                            _write_json(train_scan_dir / "axis_results.partial.json", train_rows_json)
+                            _log(
+                                f"[crossfit][train] fold={k} progress done={j}/{len(tasks)} "
+                                f"kept={len(train_axis_rows)} skipped={n_skipped} errors={n_errors} "
+                                f"elapsed={dt/60:.1f} min"
+                            )
 
                 _TRAIN_AXIS_GLOBAL = None
 
                 if not train_axis_rows:
-                    raise RuntimeError(f"Crossfit fold {k}: no train axes produced results; loosen cuts.")
+                    raise RuntimeError(
+                        f"Crossfit fold {k}: no train axes produced results; "
+                        f"skipped={n_skipped} errors={n_errors}. Loosen cuts and inspect train_scan/axis_*/worker_error.json."
+                    )
 
                 _write_json(train_scan_dir / "axis_results.json", train_rows_json)
 
@@ -2713,4 +2864,17 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception:
+        tb = traceback.format_exc()
+        crash_log = os.environ.get("ANISO_CRASH_LOG", "").strip()
+        if crash_log:
+            try:
+                p = Path(crash_log)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(tb, encoding="utf-8")
+            except Exception:
+                pass
+        print(tb, file=sys.stderr, flush=True)
+        raise
