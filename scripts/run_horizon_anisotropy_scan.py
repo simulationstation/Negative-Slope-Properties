@@ -2413,14 +2413,16 @@ def main() -> int:
 
     axis_results_path = out_dir / "axis_results.json"
     scan_summary_path = out_dir / "scan_summary.json"
-    resume_scan = bool(getattr(args, "resume_scan", False))
+    resume_scan_enabled = bool(getattr(args, "resume_scan", False))
+    resumed_from_cache = False
 
-    if resume_scan and axis_results_path.exists():
+    if resume_scan_enabled and axis_results_path.exists():
         rows_json = json.loads(axis_results_path.read_text(encoding="ascii"))
         axis_rows = [_axisresult_from_dict(d) for d in rows_json]
         if not axis_rows:
             raise RuntimeError(f"{axis_results_path} exists but contains no axis rows.")
         _log(f"[hemi] resumed axis scan from {axis_results_path} (axes={len(axis_rows)})")
+        resumed_from_cache = True
     else:
         global _HEMI_AXIS_GLOBAL
         _HEMI_AXIS_GLOBAL = {
@@ -2508,8 +2510,7 @@ def main() -> int:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        if not resume_scan:
-            (out_dir / "figures").mkdir(parents=True, exist_ok=True)
+        (out_dir / "figures").mkdir(parents=True, exist_ok=True)
         # Use best axis direction if dipole fit unavailable.
         ref = best_vec
         if dip is not None:
@@ -2518,16 +2519,15 @@ def main() -> int:
             if amp > 0:
                 ref = D / amp
         cosang = X @ ref
-        if not resume_scan:
-            plt.figure(figsize=(5.6, 3.8))
-            plt.axhline(0.0, color="k", linewidth=1, alpha=0.4)
-            plt.errorbar(cosang, y, yerr=sig, fmt="o", ms=4, alpha=0.85)
-            plt.xlabel("cos(angle to reference axis)")
-            plt.ylabel("delta_s (fore - aft)")
-            plt.title("Hemisphere scan: delta_s vs axis angle")
-            plt.tight_layout()
-            plt.savefig(out_dir / "figures" / "delta_s_vs_cosangle.png", dpi=200)
-            plt.close()
+        plt.figure(figsize=(5.6, 3.8))
+        plt.axhline(0.0, color="k", linewidth=1, alpha=0.4)
+        plt.errorbar(cosang, y, yerr=sig, fmt="o", ms=4, alpha=0.85)
+        plt.xlabel("cos(angle to reference axis)")
+        plt.ylabel("delta_s (fore - aft)")
+        plt.title("Hemisphere scan: delta_s vs axis angle")
+        plt.tight_layout()
+        plt.savefig(out_dir / "figures" / "delta_s_vs_cosangle.png", dpi=200)
+        plt.close()
     except Exception as e:
         fig_note = f"plot_failed: {type(e).__name__}: {e}"
 
@@ -2548,8 +2548,8 @@ def main() -> int:
             "Interpretation requires a null battery / look-elsewhere correction and robustness checks.",
         ],
     }
-    if not resume_scan:
-        _write_json(scan_summary_path, summary)
+    summary["meta"] = {"resumed_from_cache": bool(resumed_from_cache), "resume_scan_enabled": bool(resume_scan_enabled)}
+    _write_json(scan_summary_path, summary)
 
     # Null battery: compute a look-elsewhere calibrated p-value for the chosen statistic.
     n_null = int(args.null_reps)
