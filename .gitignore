@@ -7,6 +7,7 @@ __pycache__/
 
 # Virtual envs
 .venv/
+.venv
 venv/
 
 # Build / packaging
@@ -32,3 +33,10 @@ data/*
 # OS/editor
 .DS_Store
 Thumbs.db
+
+# LaTeX build artifacts (paper_gen outputs)
+paper_gen/*.aux
+paper_gen/*.bbl
+paper_gen/*.blg
+paper_gen/*.log
+paper_gen/*Notes.bib
