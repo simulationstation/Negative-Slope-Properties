@@ -315,7 +315,8 @@ def main() -> int:
     _log(f"[planck] mask={prod.mask_path}")
 
     # Read the Planck convergence harmonics and truncate to the requested lmax.
-    alm_full = hp.read_alm(str(prod.dat_klm_path), dtype=np.complex64)
+    alm_full = hp.read_alm(str(prod.dat_klm_path))
+    alm_full = np.asarray(alm_full, dtype=np.complex64)
     lmax_full = int(hp.Alm.getlmax(len(alm_full)))
     if args.lmax > lmax_full:
         raise ValueError(f"Requested lmax={args.lmax} exceeds file lmax={lmax_full}.")
@@ -399,7 +400,7 @@ def main() -> int:
             "dat_klm_path": prod.dat_klm_path,
             "mask_path": prod.mask_path,
         },
-        "repro": {"git_sha": git_head_sha(_REPO_ROOT), "git_dirty": git_is_dirty(_REPO_ROOT)},
+        "repro": {"git_sha": git_head_sha(repo_root=_REPO_ROOT), "git_dirty": git_is_dirty(repo_root=_REPO_ROOT)},
     }
     _write_json(outdir / "planck_lensing_hemisphere_test.json", out)
     np.save(outdir / "delta_log_var_null.npy", deltas)
@@ -409,11 +410,15 @@ def main() -> int:
     ax = fig.add_subplot(111)
     ax.hist(deltas, bins=40, density=True, color="#5b8bb2", alpha=0.85, label="random-axis null")
     ax.axvline(delta_obs, color="#d1495b", lw=2.0, label=f"observed ({delta_obs:+.3g})")
-    ax.set_xlabel(r"$\\Delta \\log \\mathrm{Var}(\\kappa)$  (north-south)")
+    ax.set_xlabel(r"$\Delta \log \mathrm{Var}(\kappa)$ (north-south)")
     ax.set_ylabel("density")
     ax.set_title(f"Planck lensing hemisphere test (fixed axis)\n" f"p(two-sided)={p_two:.3g}, z~{z_two:.2f}")
     ax.legend(loc="best", frameon=False)
-    fig.tight_layout()
+    try:
+        fig.tight_layout()
+    except Exception:
+        # Avoid a hard failure if backend mathtext/layout has issues.
+        pass
     fig.savefig(outdir / "planck_lensing_hemisphere_test.png", dpi=160)
     plt.close(fig)
 
@@ -423,4 +428,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
