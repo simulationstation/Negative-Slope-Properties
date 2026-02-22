@@ -31,6 +31,7 @@ from entropy_horizon_recon.ingest_rsd import load_rsd_fs8
 from entropy_horizon_recon.ingest_rsd_single_survey import load_rsd_single_survey
 from entropy_horizon_recon.ingest_fullshape_pk import load_fullshape_pk
 from entropy_horizon_recon.departure import compute_departure_stats
+from entropy_horizon_recon.decision_grade import slope_draws_from_logmu_samples
 from entropy_horizon_recon.inversion import infer_logmu_forward
 from entropy_horizon_recon.likelihoods import BaoLogLike, ChronometerLogLike, SNLogLike, bin_sn_loglike
 from entropy_horizon_recon.likelihoods_fsbao import FsBaoLogLike
@@ -260,7 +261,13 @@ def main() -> int:
     parser.add_argument(
         "--run-mapping-variants",
         action="store_true",
+        default=True,
         help="Run mapping sensitivity variants (Ωm0 fixed, residual R(z), and Ωk0 nuisance).",
+    )
+    parser.add_argument(
+        "--skip-mapping-variants",
+        action="store_true",
+        help="Skip mapping sensitivity variants (diagnostic/debug only).",
     )
     parser.add_argument(
         "--omega-k0-prior",
@@ -402,6 +409,8 @@ def main() -> int:
         help="Directory for checkpoint files (defaults to <out>/samples/mu_checkpoint if enabled).",
     )
     args = parser.parse_args()
+    if bool(args.skip_mapping_variants):
+        args.run_mapping_variants = False
     cpu_cores = _resolve_cpu_cores(args.cpu_cores)
     _apply_cpu_affinity(cpu_cores)
     args.cpu_cores = cpu_cores
@@ -910,6 +919,7 @@ def main() -> int:
     # --- Mapping sensitivity variants (optional; expensive) ---
     mapping_variants = {}
     mapping_sensitivity = None
+    mapping_variant_slopes = None
     if args.run_mapping_variants:
         mapping_variants["V1_free"] = mu_post
 
@@ -976,6 +986,24 @@ def main() -> int:
             rows.append([name, delta_sigma, max_abs])
         rows.sort(key=lambda r: r[0])
         mapping_sensitivity = {"logA_min": logA_min_v, "logA_max": logA_max_v, "deltas": rows}
+
+        # Scalar slope posterior by mapping variant on the common logA grid.
+        mapping_variant_slopes = {}
+        for name, samp in variant_logmu.items():
+            s_draw = slope_draws_from_logmu_samples(
+                logA_grid=logA_grid_v,
+                logmu_samples=np.asarray(samp, dtype=float),
+                weight_mode=str(args.m_weight_mode),
+            )
+            mapping_variant_slopes[name] = {
+                "mean": float(np.mean(s_draw)),
+                "std": float(np.std(s_draw, ddof=1)) if s_draw.size > 1 else 0.0,
+                "p_lt_0": float(np.mean(s_draw < 0.0)),
+                "p16": float(np.percentile(s_draw, 16.0)),
+                "p50": float(np.percentile(s_draw, 50.0)),
+                "p84": float(np.percentile(s_draw, 84.0)),
+                "n_draws": int(s_draw.size),
+            }
 
         # Overlay plot of logμ(A) under mapping variants.
         fig, ax = plt.subplots(figsize=(6, 4))
@@ -1167,6 +1195,7 @@ def main() -> int:
                     "gp_fit": gp_fit,
                     "ablations": ablations,
                     "mapping_sensitivity": mapping_sensitivity,
+                    "mapping_variant_slopes": mapping_variant_slopes,
                     "mapping_variants_meta": (
                         {k: v.meta for k, v in mapping_variants.items()} if mapping_variants else None
                     ),
@@ -1292,6 +1321,7 @@ def main() -> int:
             ),
         },
         "departure": departure,
+        "mapping_variant_slopes": mapping_variant_slopes,
         "mu_sampler": {
             "acceptance_fraction_mean": mu_post.meta.get("acceptance_fraction_mean"),
             "ess_min": mu_post.meta.get("ess_min"),
@@ -1455,12 +1485,27 @@ def main() -> int:
         for name, delta_sigma, max_abs in mapping_sensitivity["deltas"]:
             ms_rows.append([name, f"{float(delta_sigma):.2f}", f"{float(max_abs):.3g}"])
         md.append(format_table(ms_rows, headers=["Variant", "Δμ / σ (rms)", "max |Δ logμ|"]) + "\n\n")
+        if mapping_variant_slopes is not None:
+            slope_rows = []
+            for name in sorted(mapping_variant_slopes.keys()):
+                r = mapping_variant_slopes[name]
+                slope_rows.append(
+                    [
+                        name,
+                        f"{float(r['mean']):.4f}",
+                        f"{float(r['std']):.4f}",
+                        f"{float(r['p_lt_0']):.3f}",
+                        f"{float(r['p16']):.4f}/{float(r['p50']):.4f}/{float(r['p84']):.4f}",
+                    ]
+                )
+            md.append(format_table(slope_rows, headers=["Variant", "slope mean", "slope sd", "P(s<0)", "p16/p50/p84"]))
+            md.append("\n\n")
         md.append(
             "If the inferred μ(A) changes materially under these controlled mapping variants, proximity to any "
             "parametric entropy family should not be interpreted as robust.\n\n"
         )
     else:
-        md.append("Not run. Re-run with `--run-mapping-variants` to quantify mapping sensitivity.\n\n")
+        md.append("Skipped via `--skip-mapping-variants` (diagnostic mode only).\n\n")
     md.append("## Proximity tests (post hoc)\n")
     md.append(
         "Distances are computed in function space as a weighted L2 distance in logA, with weights ∝ 1/Var[log μ]. "

@@ -14,7 +14,7 @@
 \affiliation{Independent Researcher}
 
 \begin{abstract}
-The Bekenstein-Hawking area law implies a constant horizon entropy slope, $\mu(A)\propto dS/dA=\mathrm{const}$. We test this assumption directly at cosmological scales using a data-driven reconstruction of the apparent-horizon entropy current from late-time background geometry (Pantheon+, BAO, and cosmic chronometers), in a framework designed to avoid GR-anchored circularity. The reconstruction prefers a time-evolving entropy slope with a negative mean gradient, $\langle d\log\mu/d\log A\rangle\approx -0.24$, with posterior weight $P(d\log\mu/d\log A<0)\approx 0.79$. Function-space proximity metrics favor non-extensive templates (Tsallis/Barrow-like) over strict Bekenstein-Hawking behavior, with representative distances $D^2\sim10^{-8}$ versus $D^2\sim10^{-4}$ for $\mu=1$. Synthetic-closure and simulation-based calibration checks are used to verify that the recovered trend is not a reconstruction artifact. These results support a thermodynamic interpretation in which the effective gravitational sector evolves with horizon area, providing a direct theoretical bridge to modified-propagation (friction) signatures in dark-siren analyses.
+The Bekenstein-Hawking area law implies a constant horizon entropy slope, $\mu(A)\propto dS/dA=\mathrm{const}$. We test this assumption directly at cosmological scales using a data-driven reconstruction of the apparent-horizon entropy current from late-time background geometry (Pantheon+, BAO, and cosmic chronometers), in a framework designed to avoid GR-anchored circularity. In the baseline mapping, the reconstructed slope statistic is negative, with posterior mean $\langle d\log\mu/d\log A\rangle=-0.492$ and posterior weight $P(d\log\mu/d\log A<0)=0.904$. Across mapping variants, all converged runs keep a negative mean slope. However, decision-grade calibration under the Bekenstein-Hawking null ($\mu=1$) does not yet support a smoking-gun rejection: with 2000 null simulations, the calibrated exceedance is $p_{\rm one}=0.296$ (95\% Monte Carlo CI $[0.276,0.316]$), and low-false-alarm thresholds tuned to $\alpha=0.05$ and $0.01$ have weak power for plausible injected slopes. The current evidence is therefore a suggestive preference for negative slope, not a calibrated exclusion of the strict area law.
 \end{abstract}
 
 \maketitle
@@ -40,37 +40,28 @@ A(z)=4\pi\left(\frac{c}{H(z)}\right)^2
 \end{equation}
 for the flat mapping variant.
 
-The inference is performed by forward modeling: we sample a spline representation of $\log\mu$ and solve for $H(z)$, then evaluate the likelihood in data space. The baseline geometry stack is Pantheon+, BAO, and cosmic chronometers. Inference products are stress-tested with synthetic closure and simulation-based calibration (SBC), including nominal 68\% and 95\% coverage diagnostics, to ensure that apparent trends are not driven by inversion pathologies.
+The inference is performed by forward modeling: we sample a spline representation of $\log\mu$ and solve for $H(z)$, then evaluate the likelihood in data space. The baseline geometry stack is Pantheon+, BAO, and cosmic chronometers. Inference products are stress-tested with synthetic closure, simulation-based calibration (SBC), and explicit Bekenstein-Hawking null exceedance experiments using the same production settings as the real-data run.
 
 \section{Results}
 \subsection{Area-law test from reconstructed entropy current}
 The reconstructed posterior favors a negative entropy-current slope over a constant-slope area law. A representative summary is
 \begin{equation}
-\left\langle\frac{d\log\mu}{d\log A}\right\rangle \approx -0.24,\qquad
-P\!\left(\frac{d\log\mu}{d\log A}<0\right)\approx 0.79.
+\left\langle\frac{d\log\mu}{d\log A}\right\rangle_{\rm V1,free} = -0.492,\qquad
+P\!\left(\frac{d\log\mu}{d\log A}<0\right)_{\rm V1,free}=0.904.
 \end{equation}
-Interpreted physically, this corresponds to a decreasing $\mu(A)$ as the horizon area grows, i.e., an evolving entropy density on cosmological horizons.
+Interpreted physically, this corresponds to a decreasing $\mu(A)$ as the horizon area grows, i.e., an evolving entropy density on cosmological horizons. Sign stability across mapping variants is preserved in this run: V0\_fixedOm ($-0.483$, $P_{<0}=0.903$), V1\_curved ($-0.453$, $P_{<0}=0.881$), V1\_free ($-0.492$, $P_{<0}=0.904$), and V2\_residual ($-0.285$, $P_{<0}=0.764$).
 
-Function-space proximity tests provide a complementary model-comparison view. Relative to a strict Bekenstein-Hawking template ($\mu=1$), the reconstructed curve is substantially closer to non-extensive families:
-\begin{equation}
-D^2_{\rm BH}\sim10^{-4},\qquad D^2_{\rm Tsallis/Barrow}\sim10^{-8},
-\end{equation}
-indicating that non-extensive effective descriptions capture the reconstructed shape more efficiently.
+\subsection{Decision-grade calibration and BH-null exceedance}
+We calibrate thresholds directly under the Bekenstein-Hawking null using full end-to-end simulations. For each target false-alarm level $\alpha$, a threshold is selected from 2000 null simulations and then evaluated for injected-slope power (500 simulations per injected level).
 
-\subsection{Method calibration and identifiability gate}
-To verify that sign-level statements are identifiable under finite Monte Carlo noise, we retain the power-map calibration used in the production pipeline. To quantify the pipeline's ability to distinguish a true slope signal from noise, we compute true-positive rates (TPR) for injected slope anomalies of strength $\nu$. With fixed threshold $\tau=0.06459924567842923$ (false-alarm control), the baseline run gives
-\begin{align}
-\mathrm{TPR}_{\nu=0.2}&=0.3432,\quad
-\mathrm{TPR}_{\nu=0.5}=0.3805,\quad
-\mathrm{TPR}_{\nu=0.8}=0.4892,\\
-\mathrm{FPR}_{\nu=0.0}&=0.2983,\quad
-\Delta_{\rm sep}=0.1059.
-\end{align}
-Three additional full-core replicate seeds yield $\Delta_{\rm sep}=\{0.1000,0.1067,0.1089\}$, giving
+At $\alpha=0.05$, the calibrated threshold is $-1.4475$, with achieved $\mathrm{FPR}=0.050$ (95\% CI $[0.041,0.060]$), but power is low: $\mathrm{TPR}=0.028,0.032,0.052$ for injected slopes $-0.3,-0.2,-0.1$ respectively. At $\alpha=0.01$, the threshold is $-1.9846$, with achieved $\mathrm{FPR}=0.010$ (95\% CI $[0.0065,0.0154]$) and $\mathrm{TPR}=0.006,0.012,0.010$ for the same injections.
+
+Using the observed real-data scalar statistic $s_{\rm obs}=-0.4922$ (baseline V1\_free), the calibrated null exceedance from 2000 Bekenstein-Hawking simulations is
 \begin{equation}
-\langle \Delta_{\rm sep}\rangle = 0.1054,\qquad \sigma_{\rm run}=0.0038.
+p_{\rm one}=P(s_{\rm sim}\le s_{\rm obs})=0.296,\qquad
+p_{\rm two}=0.5465.
 \end{equation}
-This establishes stable, nonzero discrimination power for the mapping-choice gate used upstream of decision-grade runs.
+With the pre-defined stop rule, these results classify the current run as \textit{suggestive preference} rather than a calibrated rejection of $\mu=1$.
 
 \subsection{Hubble-scale anchors and robustness context}
 For transfer-map stress tests, we track the conventional anchor scales $H_0^{\rm Planck}=67.4\pm0.5$ and $H_0^{\rm local}=73.0\pm1.0$ km\,s$^{-1}$\,Mpc$^{-1}$ as external references. These anchors are used for sensitivity mapping, not as hard priors in the core area-law test, to preserve modified-gravity neutrality in the reconstruction stage.
@@ -83,16 +74,14 @@ To suppress look-elsewhere effects, we use a five-fold crossfit procedure in whi
 As an external cross-check, we evaluate a hemispherical Planck 2018 CMB lensing convergence variance statistic along the strongest training axis, finding $\Delta\log{\rm Var}(\kappa)\approx 0.032$ with a random-axis calibrated fixed-axis $p$-value $p\approx 0.22$ ($z\approx 1.23$). Within current sensitivity, these diagnostics provide no evidence for a robust dipolar modulation of the inferred slope statistic.
 
 \section{Discussion}
-The key physical output is not only ``negative slope detected,'' but what that slope means. A decreasing $\mu(A)$ implies that the effective entropy current changes as the Universe expands. In modified-gravity language this maps to an evolving effective Planck sector (running gravitational coupling), a known channel in scalar-tensor and $f(R)$-like effective descriptions.
+The key physical output is two-part: the posterior trend is directionally negative, but the calibrated decision layer does not yet reject the strict area law at low false-alarm settings. A decreasing $\mu(A)$ remains a plausible interpretation of the reconstructed geometry, yet the BH-null exceedance rate and low power under stringent FPR control imply that the present dataset and pipeline settings do not constitute smoking-gun evidence.
 
-The non-extensive proximity ordering is consistent with that interpretation. Tsallis/Barrow-like templates are not asserted here as unique microphysical theories; rather, they provide compact effective parameterizations of the reconstructed thermodynamic flow. Their significantly smaller $D^2$ values relative to strict Bekenstein-Hawking behavior quantify that the data-preferred trajectory is not well described by $\mu=\mathrm{const}$.
-
-The calibration and closure layers are included for this reason: to separate physics statements from pipeline artifacts. Synthetic closure and SBC checks, together with seed-level stability of the identifiability gate, support interpreting the negative-slope trend as a property of the reconstructed geometry rather than a numerical accident.
+The calibration and closure layers are included specifically to separate posterior preference from decision-grade rejection. In this run, mapping variants agree on slope sign and converge, but the low-FPR power and null-tail probability fail the pre-specified decision threshold.
 
 \section{Conclusion}
-We recast late-time entropy-slope reconstruction as a fundamental cosmological test of the Bekenstein-Hawking area law. In the reconstructed posterior, the horizon entropy current is not strictly constant and is instead biased toward a negative slope with non-extensive effective behavior favored in function space.
+We recast late-time entropy-slope reconstruction as a fundamental cosmological test of the Bekenstein-Hawking area law. In the reconstructed posterior, the horizon entropy current is biased toward a negative slope and this sign preference is stable across tested mapping variants.
 
-Most importantly, this thermodynamic evolution ($\mu(A)\neq\mathrm{const}$) provides the theory-side basis for the modified gravitational-wave propagation (friction) signals targeted in dark-siren catalogs, linking horizon thermodynamics and multimessenger cosmology in a single framework.
+At the same time, decision-grade calibration with BH-null simulations shows that the present evidence is \textit{suggestive} rather than decisive: calibrated null exceedance is not small and low-FPR operation has weak power at plausible injected effect sizes. The immediate implication is methodological: stronger data, more informative cross-probe predictive tests, or higher-power test statistics are required before claiming a smoking-gun violation of $\mu(A)=\mathrm{const}$.
 
 \section*{Data and software availability}
 Software archive for this pipeline (Zenodo title: \textit{Negative Entropy Slope}): \href{https://doi.org/10.5281/zenodo.18604922}{doi:10.5281/zenodo.18604922}.

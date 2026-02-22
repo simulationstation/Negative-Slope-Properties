@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
+import threading
 import time
 
 import numpy as np
@@ -49,6 +52,7 @@ def sample_sbc_prior_truth(
     log_sigma_d2_prior: tuple[float, float],
     sigma_d2_scale: float,
     mu_truth_mode: str = "prior",
+    mu_truth_slope: float = 0.0,
 ) -> SBCPriorTruth:
     """Sample a 'prior-truth' parameter draw consistent with infer_logmu_forward priors.
 
@@ -104,6 +108,12 @@ def sample_sbc_prior_truth(
     elif mu_truth_mode == "bh":
         # BH-null truth: μ(A)=1 => logμ=0 on all knots.
         logmu_knots = np.zeros(n_mu, dtype=float)
+    elif mu_truth_mode == "linear_slope":
+        # Anchored linear truth: logμ(x)=s*x so μ(0)=1 at z=0.
+        s = float(mu_truth_slope)
+        if not np.isfinite(s):
+            raise ValueError("mu_truth_slope must be finite for mu_truth_mode='linear_slope'.")
+        logmu_knots = s * x_knots
     else:
         raise ValueError(f"Unsupported mu_truth_mode: {mu_truth_mode}")
 
@@ -132,21 +142,6 @@ def _theta_summaries_from_logmu(
     slope = float(np.polyfit(x_grid, logmu_x, 1)[0])
     pivot = float(np.interp(float(x_pivot), x_grid, logmu_x))
     return {"logmu_mean": mean, "logmu_slope": slope, "logmu_pivot": pivot}
-
-
-def _weighted_linear_fit(x: np.ndarray, y: np.ndarray, w: np.ndarray) -> tuple[float, float]:
-    """Fit y ≈ a + b x with weights w (returns a,b)."""
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    w = np.asarray(w, dtype=float)
-    if x.shape != y.shape or x.shape != w.shape:
-        raise ValueError("x,y,w shape mismatch")
-    if np.any(w <= 0) or not np.all(np.isfinite(w)):
-        raise ValueError("w must be positive and finite")
-    X = np.column_stack([np.ones_like(x), x])
-    XtW = (X.T * w)
-    beta = np.linalg.solve(XtW @ X, XtW @ y)
-    return float(beta[0]), float(beta[1])
 
 
 def _scar_ms_from_grid(
@@ -188,11 +183,13 @@ def _scar_ms_from_grid(
     m_true = float(np.trapezoid(logmu_truth * w, x=x_grid))
     m_draw = np.trapezoid(draws * w[None, :], x=x_grid, axis=1)
 
-    _, s_true = _weighted_linear_fit(x, logmu_truth, w)
-    s_draw = np.empty(draws.shape[0], dtype=float)
-    for i in range(draws.shape[0]):
-        _, b = _weighted_linear_fit(x, draws[i], w)
-        s_draw[i] = b
+    # Weighted least-squares slope with intercept; with centered x, this is exact and vectorizable.
+    wx = w * x
+    denom = float(np.sum(wx * x))
+    if not np.isfinite(denom) or denom <= 0.0:
+        raise ValueError("Invalid weighted slope denominator.")
+    s_true = float(np.sum(wx * logmu_truth) / denom)
+    s_draw = (draws @ wx) / denom
     return m_true, float(s_true), np.asarray(m_draw, dtype=float), np.asarray(s_draw, dtype=float)
 
 
@@ -301,6 +298,19 @@ def uniformity_pvalues(ranks: np.ndarray, *, n_draws: int, n_bins: int = 20) -> 
 _SBC_PRIOR_CTX: dict | None = None
 
 
+def _append_jsonl(path: str | Path | None, rec: dict) -> None:
+    if path is None:
+        return
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    line = (json.dumps(rec, sort_keys=True) + "\n").encode("utf-8")
+    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
 def _sbc_prior_worker(i: int) -> tuple[int, dict[str, float], dict[str, np.ndarray], dict]:
     """Top-level worker for prior-truth SBC (picklable for multiprocessing)."""
     if _SBC_PRIOR_CTX is None:
@@ -308,6 +318,20 @@ def _sbc_prior_worker(i: int) -> tuple[int, dict[str, float], dict[str, np.ndarr
     ctx = _SBC_PRIOR_CTX
 
     seed = int(ctx["seed"])
+    infer_seed = seed + 2000 + int(i)
+    worker_event_path = ctx.get("worker_event_path")
+    heartbeat_s = max(0.0, float(ctx.get("worker_heartbeat_s", 0.0) or 0.0))
+    t_worker0 = time.perf_counter()
+    _append_jsonl(
+        worker_event_path,
+        {
+            "event": "worker_start",
+            "i": int(i),
+            "seed_infer": int(infer_seed),
+            "pid": int(os.getpid()),
+            "utc_s": float(time.time()),
+        },
+    )
     rng_i = np.random.default_rng(seed + 1000 + int(i))
 
     truth = sample_sbc_prior_truth(
@@ -322,6 +346,7 @@ def _sbc_prior_worker(i: int) -> tuple[int, dict[str, float], dict[str, np.ndarr
         log_sigma_d2_prior=ctx["log_sigma_d2_prior"],
         sigma_d2_scale=ctx["sigma_d2_scale_truth"],
         mu_truth_mode=str(ctx.get("mu_truth_mode", "prior")),
+        mu_truth_slope=float(ctx.get("mu_truth_slope", 0.0)),
     )
 
     fm: ForwardModel = ctx["forward_model"]
@@ -361,49 +386,129 @@ def _sbc_prior_worker(i: int) -> tuple[int, dict[str, float], dict[str, np.ndarr
         c, lower = bl.cov_cho
         Lb = c if lower else c.T
         y_obs = y_true + Lb @ rng_i.normal(size=y_true.shape)
+        # Keep the same covariance and Cholesky factors; only the observed vector changes per replicate.
         bao_likes.append(
-            BaoLogLike.from_arrays(
+            BaoLogLike(
                 dataset=bl.dataset,
                 z=bl.z,
-                y=y_obs,
+                y=np.asarray(y_obs, dtype=float),
                 obs=bl.obs,
                 cov=bl.cov,
+                cov_cho=bl.cov_cho,
+                logdet=bl.logdet,
                 constants=constants,
             )
         )
 
-    post = infer_logmu_forward(
-        z_grid=z_grid,
-        x_knots=ctx["x_knots"],
-        x_grid=ctx["x_grid"],
-        sn_z=sn_z,
-        sn_m=sn_m,
-        sn_cov=sn_cov,
-        cc_z=cc_z,
-        cc_H=cc_H,
-        cc_sigma_H=cc_sigma_H,
-        bao_likes=bao_likes,
-        constants=constants,
-        sampler_kind=str(ctx.get("sampler_kind", "emcee")),
-        pt_ntemps=int(ctx.get("pt_ntemps", 8)),
-        pt_tmax=ctx.get("pt_tmax", None),
-        n_walkers=int(ctx["n_walkers"]),
-        n_steps=int(ctx["n_steps"]),
-        n_burn=int(ctx["n_burn"]),
-        seed=seed + 2000 + int(i),
-        n_processes=1,
-        n_draws=int(ctx["n_draws"]),
-        progress=False,
-        max_rss_mb=float(ctx["max_rss_mb"]) if ctx.get("max_rss_mb") is not None else None,
-        omega_m0_prior=ctx["omega_m0_prior"],
-        H0_prior=ctx["H0_prior"],
-        r_d_prior=ctx["r_d_prior"],
-        sigma_cc_jit_scale=float(ctx["sigma_cc_jit_scale"]),
-        sigma_sn_jit_scale=float(ctx["sigma_sn_jit_scale"]),
-        logmu_knot_scale=float(ctx["logmu_knot_scale"]),
-        log_sigma_d2_prior=ctx["log_sigma_d2_prior"],
-        sigma_d2_scale=float(ctx["sigma_d2_scale_infer"]),
-        debug_log_path=ctx.get("debug_log_path"),
+    _append_jsonl(
+        worker_event_path,
+        {
+            "event": "worker_infer_start",
+            "i": int(i),
+            "seed_infer": int(infer_seed),
+            "pid": int(os.getpid()),
+            "utc_s": float(time.time()),
+        },
+    )
+    threadpool_ctx = contextlib.nullcontext()
+    if bool(ctx.get("limit_blas_threads", True)):
+        try:
+            from threadpoolctl import threadpool_limits  # type: ignore
+
+            threadpool_ctx = threadpool_limits(limits=1)
+        except Exception:
+            threadpool_ctx = contextlib.nullcontext()
+
+    infer_t0 = time.perf_counter()
+    hb_stop = threading.Event()
+    hb_thread: threading.Thread | None = None
+    if worker_event_path is not None and heartbeat_s > 0.0:
+        pid = int(os.getpid())
+
+        def _heartbeat() -> None:
+            while not hb_stop.wait(timeout=float(heartbeat_s)):
+                _append_jsonl(
+                    worker_event_path,
+                    {
+                        "event": "worker_heartbeat",
+                        "i": int(i),
+                        "pid": pid,
+                        "seed_infer": int(infer_seed),
+                        "infer_elapsed_s": float(time.perf_counter() - infer_t0),
+                        "worker_elapsed_s": float(time.perf_counter() - t_worker0),
+                        "utc_s": float(time.time()),
+                    },
+                )
+
+        hb_thread = threading.Thread(target=_heartbeat, name=f"sbc-heartbeat-{int(i)}", daemon=True)
+        hb_thread.start()
+
+    try:
+        with threadpool_ctx:
+            post = infer_logmu_forward(
+                z_grid=z_grid,
+                x_knots=ctx["x_knots"],
+                x_grid=ctx["x_grid"],
+                sn_z=sn_z,
+                sn_m=sn_m,
+                sn_cov=sn_cov,
+                cc_z=cc_z,
+                cc_H=cc_H,
+                cc_sigma_H=cc_sigma_H,
+                bao_likes=bao_likes,
+                constants=constants,
+                sampler_kind=str(ctx.get("sampler_kind", "emcee")),
+                pt_ntemps=int(ctx.get("pt_ntemps", 8)),
+                pt_tmax=ctx.get("pt_tmax", None),
+                n_walkers=int(ctx["n_walkers"]),
+                n_steps=int(ctx["n_steps"]),
+                n_burn=int(ctx["n_burn"]),
+                seed=int(infer_seed),
+                n_processes=1,
+                n_draws=int(ctx["n_draws"]),
+                progress=False,
+                max_rss_mb=float(ctx["max_rss_mb"]) if ctx.get("max_rss_mb") is not None else None,
+                omega_m0_prior=ctx["omega_m0_prior"],
+                H0_prior=ctx["H0_prior"],
+                r_d_prior=ctx["r_d_prior"],
+                sigma_cc_jit_scale=float(ctx["sigma_cc_jit_scale"]),
+                sigma_sn_jit_scale=float(ctx["sigma_sn_jit_scale"]),
+                logmu_knot_scale=float(ctx["logmu_knot_scale"]),
+                log_sigma_d2_prior=ctx["log_sigma_d2_prior"],
+                sigma_d2_scale=float(ctx["sigma_d2_scale_infer"]),
+                debug_log_path=ctx.get("debug_log_path"),
+                quiet=bool(ctx.get("inner_quiet", True)),
+            )
+    except Exception as exc:
+        _append_jsonl(
+            worker_event_path,
+            {
+                "event": "worker_error",
+                "i": int(i),
+                "pid": int(os.getpid()),
+                "seed_infer": int(infer_seed),
+                "stage": "infer",
+                "worker_elapsed_s": float(time.perf_counter() - t_worker0),
+                "error": f"{type(exc).__name__}: {exc}",
+                "utc_s": float(time.time()),
+            },
+        )
+        raise
+    finally:
+        if hb_thread is not None:
+            hb_stop.set()
+            hb_thread.join(timeout=1.0)
+    _append_jsonl(
+        worker_event_path,
+        {
+            "event": "worker_infer_done",
+            "i": int(i),
+            "pid": int(os.getpid()),
+            "seed_infer": int(infer_seed),
+            "infer_runtime_s": float(time.perf_counter() - infer_t0),
+            "acceptance_fraction_mean": float(post.meta.get("acceptance_fraction_mean", np.nan)),
+            "utc_s": float(time.time()),
+        },
     )
 
     x_knots = ctx["x_knots"]
@@ -437,6 +542,10 @@ def _sbc_prior_worker(i: int) -> tuple[int, dict[str, float], dict[str, np.ndarr
         t[f"proj{j}"] = float(V[j] @ logmu_true_x)
 
     logmu_samps = np.asarray(post.logmu_x_samples, dtype=float)
+    x_centered = np.asarray(x_grid - float(np.mean(x_grid)), dtype=float)
+    x_centered_norm = float(np.sum(x_centered**2))
+    if not np.isfinite(x_centered_norm) or x_centered_norm <= 0.0:
+        raise ValueError("Invalid x_grid for slope summary.")
     draws: dict[str, np.ndarray] = {
         "H0": np.asarray(post.params["H0"], dtype=float),
         "omega_m0": np.asarray(post.params["omega_m0"], dtype=float),
@@ -444,7 +553,7 @@ def _sbc_prior_worker(i: int) -> tuple[int, dict[str, float], dict[str, np.ndarr
         "sigma_cc_jit": np.asarray(post.params["sigma_cc_jit"], dtype=float),
         "sigma_sn_jit": np.asarray(post.params["sigma_sn_jit"], dtype=float),
         "logmu_mean": np.mean(logmu_samps, axis=1),
-        "logmu_slope": np.polyfit(x_grid, logmu_samps.T, 1)[0],
+        "logmu_slope": (logmu_samps @ x_centered) / x_centered_norm,
         "logmu_pivot": _interp_scalar_on_rows(x_pivot, x_grid, logmu_samps),
         "scar_m": m_draw,
         "scar_s": s_draw,
@@ -456,6 +565,18 @@ def _sbc_prior_worker(i: int) -> tuple[int, dict[str, float], dict[str, np.ndarr
         "acceptance_fraction_mean": float(post.meta.get("acceptance_fraction_mean", np.nan)),
         "logprob": post.meta.get("logprob", {}),
     }
+    _append_jsonl(
+        worker_event_path,
+        {
+            "event": "worker_done",
+            "i": int(i),
+            "pid": int(os.getpid()),
+            "seed_infer": int(infer_seed),
+            "runtime_s": float(time.perf_counter() - t_worker0),
+            "acceptance_fraction_mean": float(meta.get("acceptance_fraction_mean", np.nan)),
+            "utc_s": float(time.time()),
+        },
+    )
     return int(i), t, draws, meta
 
 
@@ -492,11 +613,17 @@ def run_sbc_prior_truth(
     sigma_d2_scale: float = 0.23,
     sigma_d2_scale_infer: float | None = None,
     mu_truth_mode: str = "prior",
+    mu_truth_slope: float = 0.0,
     rank_bins: int = 20,
     debug_log_path: str | Path | None = None,
     progress: bool = False,
     progress_path: str | Path | None = None,
     progress_every: int = 1,
+    worker_event_path: str | Path | None = None,
+    inner_quiet: bool = True,
+    limit_blas_threads: bool = True,
+    worker_heartbeat_s: float = 30.0,
+    worker_tasks_per_child: int = 8,
 ) -> dict:
     """Run proper prior-truth SBC for the forward μ(A) inference.
 
@@ -529,6 +656,10 @@ def run_sbc_prior_truth(
 
     if n_processes is None or n_processes <= 0:
         n_processes = 1
+    worker_tasks_per_child = int(worker_tasks_per_child)
+    if worker_tasks_per_child < 0:
+        worker_tasks_per_child = 0
+    worker_heartbeat_s = max(0.0, float(worker_heartbeat_s))
     # Initialize global context for multiprocessing workers.
     global _SBC_PRIOR_CTX
     _SBC_PRIOR_CTX = {
@@ -556,6 +687,7 @@ def run_sbc_prior_truth(
         "sigma_d2_scale_truth": float(sigma_d2_scale),
         "sigma_d2_scale_infer": float(sigma_d2_scale_infer if sigma_d2_scale_infer is not None else sigma_d2_scale),
         "mu_truth_mode": str(mu_truth_mode),
+        "mu_truth_slope": float(mu_truth_slope),
         "n_walkers": int(n_walkers),
         "n_steps": int(n_steps),
         "n_burn": int(n_burn),
@@ -564,6 +696,10 @@ def run_sbc_prior_truth(
         "V": V,
         "x_pivot": float(x_pivot),
         "debug_log_path": str(debug_log_path) if debug_log_path is not None else None,
+        "worker_event_path": str(worker_event_path) if worker_event_path is not None else None,
+        "inner_quiet": bool(inner_quiet),
+        "limit_blas_threads": bool(limit_blas_threads),
+        "worker_heartbeat_s": float(worker_heartbeat_s),
     }
 
     # Run SBC replicates.
@@ -609,24 +745,26 @@ def run_sbc_prior_truth(
                 f.write(json.dumps(rec, sort_keys=True) + "\n")
                 f.flush()
 
-    if n_processes > 1:
-        import multiprocessing as mp
+    try:
+        if n_processes > 1:
+            import multiprocessing as mp
 
-        with mp.get_context("fork").Pool(processes=int(n_processes), maxtasksperchild=1) as pool:
-            for i, t, d, m in pool.imap_unordered(_sbc_prior_worker, list(range(int(N))), chunksize=1):
+            maxtasks = int(worker_tasks_per_child) if int(worker_tasks_per_child) > 0 else None
+            with mp.get_context("fork").Pool(processes=int(n_processes), maxtasksperchild=maxtasks) as pool:
+                for i, t, d, m in pool.imap_unordered(_sbc_prior_worker, list(range(int(N))), chunksize=1):
+                    truths[int(i)] = t
+                    post_draws[int(i)] = d
+                    metas[int(i)] = m
+                    _report_progress(int(i), m)
+        else:
+            for i in range(int(N)):
+                i, t, d, m = _sbc_prior_worker(int(i))
                 truths[int(i)] = t
                 post_draws[int(i)] = d
                 metas[int(i)] = m
                 _report_progress(int(i), m)
-    else:
-        for i in range(int(N)):
-            i, t, d, m = _sbc_prior_worker(int(i))
-            truths[int(i)] = t
-            post_draws[int(i)] = d
-            metas[int(i)] = m
-            _report_progress(int(i), m)
-
-    _SBC_PRIOR_CTX = None
+    finally:
+        _SBC_PRIOR_CTX = None
 
     if any(t is None for t in truths) or any(d is None for d in post_draws) or any(m is None for m in metas):
         raise RuntimeError("SBC replicate missing result (worker crash or early exit).")
@@ -694,6 +832,7 @@ def run_sbc_prior_truth(
         "meta": {
             "seed": int(seed),
             "mu_truth_mode": str(mu_truth_mode),
+            "mu_truth_slope": float(mu_truth_slope),
             "rank_bins": int(rank_bins),
             "sampler_kind": str(sampler_kind),
             "pt_ntemps": int(pt_ntemps),
@@ -702,6 +841,11 @@ def run_sbc_prior_truth(
             "n_steps": int(n_steps),
             "n_burn": int(n_burn),
             "n_processes": int(n_processes),
+            "inner_quiet": bool(inner_quiet),
+            "limit_blas_threads": bool(limit_blas_threads),
+            "worker_heartbeat_s": float(worker_heartbeat_s),
+            "worker_tasks_per_child": int(worker_tasks_per_child),
+            "worker_event_path": str(worker_event_path) if worker_event_path is not None else None,
             "acceptance_fraction_mean_mean": float(np.nanmean(accept)),
             "logprob": {
                 "total_calls": int(logprob_tot),

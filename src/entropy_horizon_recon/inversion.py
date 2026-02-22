@@ -174,6 +174,7 @@ def infer_logmu_forward(
     save_chain_path: str | Path | None = None,
     checkpoint_every: int = 0,
     checkpoint_path: str | Path | None = None,
+    quiet: bool = False,
 ) -> ForwardMuPosterior:
     """Infer log μ(A) by forward-modeling H(z) via integral/ODE mapping.
 
@@ -188,6 +189,8 @@ def infer_logmu_forward(
     from scipy.interpolate import CubicSpline
 
     def _safe_log(msg: str) -> None:
+        if bool(quiet):
+            return
         try:
             print(str(msg), flush=True)
         except BrokenPipeError:
